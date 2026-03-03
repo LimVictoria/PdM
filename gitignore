@@ -1,0 +1,59 @@
+# ── Data ──────────────────────────────────────────────────────────────────
+# Never commit raw data — too large and NASA has its own distribution
+data/raw/*.txt
+data/raw/*.csv
+data/raw/*.zip
+data/processed/
+
+# ── Model artifacts ───────────────────────────────────────────────────────
+# Model weights can be 50-200MB — use GitHub Releases or MLflow for sharing
+artifacts/*.pt
+artifacts/*.pkl
+artifacts/*.onnx
+artifacts/plots/
+
+# ── MLflow ────────────────────────────────────────────────────────────────
+# Each developer has their own local runs
+mlruns/
+mlartifacts/
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── OS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
+runs/
+
+# ── Environment ───────────────────────────────────────────────────────────
+.env
+.env.local
+config.local.yaml
