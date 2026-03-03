@@ -19,7 +19,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
+# from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Tuple, Dict, Optional
@@ -375,13 +376,16 @@ def train(config_path: str = "configs/config.yaml"):
             T_max=tcfg["epochs"],
             eta_min=tcfg["lr_min"]
         )
+    elif tcfg["lr_scheduler"] == "plateau":
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=tcfg.get("lr_factor", 0.5),
+            patience=tcfg.get("lr_patience", 5),
+            min_lr=tcfg["lr_min"]
+        )
     else:
         scheduler = StepLR(optimizer, step_size=30, gamma=0.5)
-
-    early_stopping = EarlyStopping(
-        patience=tcfg["patience"],
-        min_delta=tcfg["min_delta"]
-    )
 
     best_val_loss   = float("inf")
     best_model_path = "artifacts/best_model.pt"
@@ -416,7 +420,10 @@ def train(config_path: str = "configs/config.yaml"):
             train_losses, tr_rul_p, tr_rul_t, tr_cls_p, tr_cls_t = run_epoch(
                 model, train_loader, criterion, optimizer, device, training=True
             )
-            scheduler.step()
+            if tcfg["lr_scheduler"] == "plateau":
+                scheduler.step(val_losses["total_loss"])
+            else:
+                scheduler.step()
 
             val_losses, val_rul_p, val_rul_t, val_cls_p, val_cls_t = run_epoch(
                 model, val_loader, criterion, None, device, training=False
@@ -526,7 +533,6 @@ def train(config_path: str = "configs/config.yaml"):
         print(f"[INFO] Model saved at: artifacts/best_model.pt")
 
     return model, artifacts
-
 
 # ---------------------------------------------------------------------------
 # Entry point
