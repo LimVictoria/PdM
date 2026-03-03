@@ -263,39 +263,56 @@ def compute_rul(df: pd.DataFrame, rul_cap: int = 125) -> pd.DataFrame:
 
 def compute_class_labels(
     df: pd.DataFrame,
-    bins: Tuple[int, int, int] = (125, 75, 25)
+    bins: Tuple[int, int, int] = (75, 50, 25)
 ) -> pd.DataFrame:
     """
-    Derive 4-class health label from RUL:
-        Class 0 — Healthy:   RUL > 125
-        Class 1 — Degrading: 75 < RUL <= 125
-        Class 2 — Warning:   25 < RUL <= 75
-        Class 3 — Critical:  RUL <= 25
+    Derive 4-class health label from capped RUL (max=125):
+
+        Class 0 — Healthy:   RUL >= 75  (early life, far from failure)
+        Class 1 — Degrading: 50 <= RUL < 75
+        Class 2 — Warning:   25 <= RUL < 50
+        Class 3 — Critical:  RUL < 25   (imminent failure)
+
+    Note: bins are set relative to the RUL cap (125).
+    With cap=125, using >125 for Class 0 means Class 0 never
+    appears (max RUL is exactly 125 after capping).
+    These bins ensure all 4 classes are always populated.
     """
     df = df.copy()
     healthy, degrading, warning = bins
 
     conditions = [
-        df["rul"] > healthy,
-        (df["rul"] > degrading) & (df["rul"] <= healthy),
-        (df["rul"] > warning)   & (df["rul"] <= degrading),
-        df["rul"] <= warning
+        df["rul"] >= healthy,
+        (df["rul"] >= degrading) & (df["rul"] < healthy),
+        (df["rul"] >= warning)   & (df["rul"] < degrading),
+        df["rul"] < warning
     ]
     df["health_class"] = np.select(conditions, [0, 1, 2, 3])
 
     return df
 
 
-def compute_class_weights(df: pd.DataFrame) -> torch.Tensor:
+def compute_class_weights(df: pd.DataFrame, num_classes: int = 4) -> torch.Tensor:
     """
     Compute inverse frequency class weights for weighted loss.
-    w_c = total_samples / (n_classes * count_c)
+    w_c = total_samples / (num_classes * count_c)
+
+    Always returns a tensor of length num_classes.
+    If a class is missing from data, assigns weight=1.0 as fallback.
     """
-    counts = df["health_class"].value_counts().sort_index()
-    n_classes = len(counts)
-    n_total   = len(df)
-    weights   = n_total / (n_classes * counts.values)
-    weights   = weights / weights.sum() * n_classes   # normalise
+    counts  = df["health_class"].value_counts().sort_index()
+    n_total = len(df)
+
+    weights = []
+    for c in range(num_classes):
+        if c in counts.index and counts[c] > 0:
+            w = n_total / (num_classes * counts[c])
+        else:
+            w = 1.0   # fallback for missing class
+        weights.append(w)
+
+    weights = np.array(weights)
+    weights = weights / weights.sum() * num_classes   # normalise
 
     return torch.FloatTensor(weights)
 
