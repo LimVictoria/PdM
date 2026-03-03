@@ -555,12 +555,23 @@ def build_windows(
         ruls   = group["rul"].values.astype(np.float32)
         classes = group["health_class"].values.astype(np.int64)
 
-        # Static features: one-hot op_cluster + one-hot fault_mode
+        # Static features: one-hot op_cluster + one-hot fault_mode + one-hot subset
         engine_cluster   = int(group["engine_cluster"].iloc[0])
         engine_fault     = int(group["fault_mode"].iloc[0])
-        cluster_onehot   = np.eye(6, dtype=np.float32)[engine_cluster]
+        engine_subset    = group["subset"].iloc[0]
+
+        # n_clusters is dynamic — use actual number of clusters
+        n_clusters_actual = int(group["engine_cluster"].max()) + 1
+        cluster_onehot   = np.eye(3, dtype=np.float32)[engine_cluster]
         fault_onehot     = np.eye(2, dtype=np.float32)[engine_fault]
-        static_vec       = np.concatenate([cluster_onehot, fault_onehot])
+
+        # Subset one-hot: FD001=0, FD002=1, FD003=2, FD004=3
+        subset_map   = {"FD001": 0, "FD002": 1, "FD003": 2, "FD004": 3}
+        subset_id    = subset_map.get(engine_subset, 0)
+        subset_onehot = np.eye(4, dtype=np.float32)[subset_id]
+
+        # Total static: 3 + 2 + 4 = 9 → pad to 10 for round number
+        static_vec = np.concatenate([cluster_onehot, fault_onehot, subset_onehot])
 
         n_cycles = len(seq)
 
@@ -642,9 +653,13 @@ def build_test_windows(
 
         engine_cluster = int(group["engine_cluster"].iloc[0])
         engine_fault   = int(group["fault_mode"].iloc[0])
-        cluster_onehot = np.eye(6, dtype=np.float32)[engine_cluster]
+        engine_subset  = group["subset"].iloc[0]
+        cluster_onehot = np.eye(3, dtype=np.float32)[engine_cluster]
         fault_onehot   = np.eye(2, dtype=np.float32)[engine_fault]
-        static_vec     = np.concatenate([cluster_onehot, fault_onehot])
+        subset_map     = {"FD001": 0, "FD002": 1, "FD003": 2, "FD004": 3}
+        subset_id      = subset_map.get(engine_subset, 0)
+        subset_onehot  = np.eye(4, dtype=np.float32)[subset_id]
+        static_vec     = np.concatenate([cluster_onehot, fault_onehot, subset_onehot])
 
         X_list.append(window)
         static_list.append(static_vec)
@@ -725,10 +740,17 @@ def load_artifacts(save_dir: str = "artifacts") -> dict:
 
 def preprocess(
     config_path: str = "configs/config.yaml",
-    save_artifacts_dir: Optional[str] = "artifacts"
+    save_artifacts_dir: Optional[str] = "artifacts",
+    config_override: Optional[dict] = None
 ) -> Tuple[DataLoader, DataLoader, DataLoader, torch.Tensor, dict]:
     """
     Full preprocessing pipeline. Returns DataLoaders ready for training.
+
+    Args:
+        config_path:      Path to config.yaml
+        save_artifacts_dir: Where to save preprocessing artifacts
+        config_override:  Dict to override config values (used by Optuna)
+                          If provided, merges on top of config_path values
 
     Returns:
         train_loader:   DataLoader for training
@@ -738,6 +760,13 @@ def preprocess(
         artifacts:      Dict of fitted scalers/kmeans for deployment
     """
     cfg = load_config(config_path)
+    if config_override is not None:
+        # Deep merge override on top of base config
+        for section, values in config_override.items():
+            if isinstance(values, dict) and section in cfg:
+                cfg[section].update(values)
+            else:
+                cfg[section] = values
 
     raw_dir     = cfg["data"]["raw_dir"]
     subsets     = cfg["data"]["subsets"]
