@@ -191,16 +191,50 @@ def load_all_subsets(
 # Step 2: Drop flat sensors
 # ---------------------------------------------------------------------------
 
-def get_flat_sensors(df: pd.DataFrame, threshold: float = 0.001) -> List[str]:
+def get_flat_sensors(
+    df: pd.DataFrame,
+    variance_percentile: float = 1.0
+) -> List[str]:
     """
-    Return literature-validated flat sensors for CMAPSS.
-    Sensors s1, s5, s6, s10, s16, s18, s19 have near-zero
-    variance across all operating conditions in all 4 subsets.
-    Always use the hardcoded list for consistency.
+    Identify flat sensors using variance percentile cutoff.
+
+    Instead of a fixed threshold (which breaks across raw/normalised scales),
+    we drop sensors whose variance falls in the bottom N percentile
+    across all engines.
+
+    This is scale-invariant and data-driven — works on any dataset.
+
+    Args:
+        df:                   DataFrame with sensor columns
+        variance_percentile:  Drop sensors below this percentile of variance
+                              Default 1.0 = bottom 1% (very conservative)
+                              For CMAPSS, use 30.0 to match literature list
+
+    Returns:
+        List of sensor column names to drop
     """
-    literature_drop = [f"s{i}" for i in [1, 5, 6, 10, 16, 18, 19]]
-    print(f"      Dropping (literature): {literature_drop}")
-    return literature_drop
+    variances = {}
+    for col in ALL_SENSOR_COLS:
+        if col in df.columns:
+            variances[col] = df[col].var()
+
+    variance_series = pd.Series(variances)
+    threshold       = np.percentile(variance_series.values, variance_percentile)
+
+    flat = variance_series[variance_series <= threshold].index.tolist()
+
+    # Validate against literature for CMAPSS
+    literature = {f"s{i}" for i in [1, 5, 6, 10, 16, 18, 19]}
+    detected   = set(flat)
+
+    if detected != literature:
+        print(f"      [INFO] Detected flat: {sorted(detected)}")
+        print(f"      [INFO] Literature:    {sorted(literature)}")
+        print(f"      [INFO] Using detected. If unexpected, adjust variance_percentile.")
+    else:
+        print(f"      Flat sensors match literature: {sorted(detected)}")
+
+    return flat
 
 
 def drop_flat_sensors(df: pd.DataFrame, flat_sensors: List[str]) -> pd.DataFrame:
@@ -617,7 +651,8 @@ def preprocess(
 
     # ── Step 2: Drop flat sensors ─────────────────────────────────────────
     print("[2/9] Identifying and dropping flat sensors...")
-    flat_sensors = get_flat_sensors(train_all)
+    percentile   = cfg["data"].get("flat_sensor_percentile", 30.0)
+    flat_sensors = get_flat_sensors(train_all, variance_percentile=percentile)
     print(f"      Dropping: {flat_sensors}")
     train_all = drop_flat_sensors(train_all, flat_sensors)
     test_all  = drop_flat_sensors(test_all,  flat_sensors)
