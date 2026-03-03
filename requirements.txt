@@ -9,6 +9,9 @@ pyyaml>=6.0
 huggingface_hub>=0.20.0
 dagshub>=0.3.0
 
+# Hyperparameter tuning
+optuna>=3.0.0
+
 # Experiment tracking
 mlflow>=2.8.0
 
