@@ -1,105 +1,61 @@
 data:
-  raw_dir: "data/raw"
-  subsets: ["FD001", "FD002", "FD003", "FD004"]
+  raw_dir: data/raw
+  subsets:
+  - FD001
+  - FD002
+  - FD003
+  - FD004
   window_size: 30
   rul_cap: 125
   val_split: 0.2
   random_seed: 42
-
-  # Flat sensor detection
-  # Drops sensors in bottom N% of variance — scale invariant
-  # 30.0 correctly identifies the 7 flat sensors in CMAPSS
-  # Increase if too few dropped, decrease if too many
   flat_sensor_percentile: 30.0
-
-  # Class boundaries (relative to rul_cap=125)
-  # Must ensure all 4 classes appear in training data
   class_bins:
-    healthy: 75        # RUL >= 75  → Class 0 (Healthy)
-    degrading: 50      # RUL >= 50  → Class 1 (Degrading)
-    warning: 25        # RUL >= 25  → Class 2 (Warning)
-    critical: 0        # RUL < 25   → Class 3 (Critical)
-
-  # Class weight override
-  # Manually force Critical (class 3) to have highest weight
-  # Comment out to use automatic inverse frequency weights
-  # class_weight_override: [1.5, 2.5, 2.0, 1.0]  ← uncomment to override
-  # Leave commented to use automatic inverse frequency weights
-  #                        ↑    ↑    ↑    ↑
-  #                      Hlthy Deg Warn Critical
-
-  # Oversampling — duplicate minority class windows
-  # Safe for time series (no synthetic data)
+    healthy: 75
+    degrading: 50
+    warning: 25
+    critical: 0
   oversample: false
-  oversample_ratio: 0.3   # minority gets 50% of majority count
-
-  # Operating condition clustering
-  n_clusters: 3  # FD001/FD003 have 1 condition, FD002/FD004 have 6 but cluster to ~3
-
-  # Fault mode per subset
+  oversample_ratio: 0.3
+  n_clusters: 3
   fault_modes:
     FD001: 0
     FD002: 0
     FD003: 1
     FD004: 1
-
+  class_weight_override: null
 model:
-  # Sequential input dim: 14 sensors + 3 op_settings
-  input_dim: 17  # 14 sensors + 3 op_settings (after dropping 7 flat sensors)
-  # Static input dim: 3 clusters (one-hot) + 2 fault modes (one-hot) + 4 subsets (one-hot) = 9
+  input_dim: 17
   static_dim: 9
   hidden_dim: 128
   num_lstm_layers: 2
   dropout: 0.3
-
-  # Multi-scale CNN kernels
-  cnn_kernels: [3, 5, 7]
+  cnn_kernels:
+  - 3
+  - 5
+  - 7
   cnn_out_channels: 64
-
-  # Attention
   attention_dim: 64
-
-  # Dual head
   num_classes: 4
-
 training:
   epochs: 50
   batch_size: 128
   learning_rate: 0.0003
   weight_decay: 0.0001
-
-  # Combined loss weight
-  # Loss = alpha * MSE + (1 - alpha) * FocalCE
-  alpha: 0.5  # truly 50/50 with loss normalisation
-
-  # Focal loss gamma
+  alpha: 0.5
   focal_gamma: 2.0
-
-  # Early stopping
   patience: 15
   min_delta: 0.001
-
-  # LR scheduler
-  lr_scheduler: "cosine"   # cosine or step
-  lr_min: 0.00001
-
+  lr_scheduler: cosine
+  lr_min: 1.0e-05
 inference:
-  # MC Dropout passes for uncertainty
   mc_passes: 50
-
-  # Recursive window size matches training
   window_size: 30
-
 mlflow:
-  experiment_name: "cmapss_rul_prediction"
-  tracking_uri: "mlruns"
-
-  # DagsHub — remote MLflow server, viewable from anywhere
-  # Sign up free at dagshub.com then fill these in
-  # Leave blank to use local mlruns/ instead
-  dagshub_user: "LimVictoria"
-  dagshub_repo: "PdM"
-
+  experiment_name: cmapss_rul_prediction
+  tracking_uri: mlruns
+  dagshub_user: LimVictoria
+  dagshub_repo: PdM
 api:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 8000
