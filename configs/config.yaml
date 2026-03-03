@@ -77,6 +77,12 @@ mlflow:
   experiment_name: "cmapss_rul_prediction"
   tracking_uri: "mlruns"
 
+  # DagsHub — remote MLflow server, viewable from anywhere
+  # Sign up free at dagshub.com then fill these in
+  # Leave blank to use local mlruns/ instead
+  dagshub_user: "LimVictoria"
+  dagshub_repo: "PdM"
+
 api:
   host: "0.0.0.0"
   port: 8000
