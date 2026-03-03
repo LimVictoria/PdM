@@ -292,14 +292,28 @@ def compute_class_labels(
     return df
 
 
-def compute_class_weights(df: pd.DataFrame, num_classes: int = 4) -> torch.Tensor:
+def compute_class_weights(
+    df: pd.DataFrame,
+    num_classes: int = 4,
+    override: Optional[List[float]] = None
+) -> torch.Tensor:
     """
-    Compute inverse frequency class weights for weighted loss.
-    w_c = total_samples / (num_classes * count_c)
+    Compute class weights for weighted loss.
+
+    Two modes:
+        1. override=None: inverse frequency weights (automatic)
+        2. override=[w0,w1,w2,w3]: manual weights (from config)
 
     Always returns a tensor of length num_classes.
-    If a class is missing from data, assigns weight=1.0 as fallback.
+    If a class is missing, assigns weight=1.0 as fallback.
     """
+    if override is not None:
+        # Manual override from config
+        assert len(override) == num_classes,             f"override must have {num_classes} values, got {len(override)}"
+        print(f"      Using manual class weight override: {override}")
+        return torch.FloatTensor(override)
+
+    # Automatic inverse frequency
     counts  = df["health_class"].value_counts().sort_index()
     n_total = len(df)
 
@@ -308,13 +322,91 @@ def compute_class_weights(df: pd.DataFrame, num_classes: int = 4) -> torch.Tenso
         if c in counts.index and counts[c] > 0:
             w = n_total / (num_classes * counts[c])
         else:
-            w = 1.0   # fallback for missing class
+            w = 1.0
         weights.append(w)
 
     weights = np.array(weights)
-    weights = weights / weights.sum() * num_classes   # normalise
+    weights = weights / weights.sum() * num_classes
 
     return torch.FloatTensor(weights)
+
+
+def oversample_minority_classes(
+    X:       np.ndarray,
+    static:  np.ndarray,
+    y_rul:   np.ndarray,
+    y_class: np.ndarray,
+    target_ratio: float = 0.5,
+    random_seed:  int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Oversample minority classes by duplicating existing windows.
+    Safe for time series — no synthetic data created.
+
+    Strategy:
+        Find the majority class count
+        Oversample each minority class up to target_ratio
+        of majority class count
+
+    Args:
+        target_ratio: minority class target as fraction of majority
+                      0.5 = minority gets 50% as many samples as majority
+                      1.0 = fully balanced (equal samples per class)
+
+    Returns:
+        Oversampled X, static, y_rul, y_class
+    """
+    rng = np.random.RandomState(random_seed)
+
+    class_counts = {c: (y_class == c).sum() for c in range(4)}
+    majority_count = max(class_counts.values())
+    target_count   = int(majority_count * target_ratio)
+
+    print(f"      Class distribution before oversampling:")
+    class_names = ["Healthy", "Degrading", "Warning", "Critical"]
+    for c, name in enumerate(class_names):
+        print(f"        Class {c} ({name}): {class_counts[c]:,}")
+
+    X_list      = [X]
+    static_list = [static]
+    rul_list    = [y_rul]
+    class_list  = [y_class]
+
+    for c in range(4):
+        count = class_counts[c]
+        if count < target_count:
+            # How many extra samples needed
+            n_extra = target_count - count
+
+            # Indices of this class
+            idx = np.where(y_class == c)[0]
+
+            # Sample with replacement
+            extra_idx = rng.choice(idx, size=n_extra, replace=True)
+
+            X_list.append(X[extra_idx])
+            static_list.append(static[extra_idx])
+            rul_list.append(y_rul[extra_idx])
+            class_list.append(y_class[extra_idx])
+
+    X_out      = np.concatenate(X_list,      axis=0)
+    static_out = np.concatenate(static_list, axis=0)
+    rul_out    = np.concatenate(rul_list,    axis=0)
+    class_out  = np.concatenate(class_list,  axis=0)
+
+    # Shuffle to mix oversampled with original
+    shuffle_idx = rng.permutation(len(X_out))
+    X_out      = X_out[shuffle_idx]
+    static_out = static_out[shuffle_idx]
+    rul_out    = rul_out[shuffle_idx]
+    class_out  = class_out[shuffle_idx]
+
+    new_counts = {c: (class_out == c).sum() for c in range(4)}
+    print(f"      Class distribution after oversampling:")
+    for c, name in enumerate(class_names):
+        print(f"        Class {c} ({name}): {new_counts[c]:,}")
+
+    return X_out, static_out, rul_out, class_out
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +777,8 @@ def preprocess(
 
     # ── Step 4b: Class weights ────────────────────────────────────────────
     print("[4/9] Computing class weights...")
-    class_weights = compute_class_weights(train_all)
+    weight_override = cfg["data"].get("class_weight_override", None)
+    class_weights   = compute_class_weights(train_all, override=weight_override)
     print(f"      Class weights: {class_weights.tolist()}")
 
     # ── Step 5: Clustering ────────────────────────────────────────────────
@@ -716,6 +809,17 @@ def preprocess(
     X_tr, s_tr, r_tr, c_tr = build_windows(
         train_df, sensor_cols, window_size, stride=1
     )
+
+    # ── Oversample minority classes ───────────────────────────────────────
+    oversample        = cfg["data"].get("oversample", True)
+    oversample_ratio  = cfg["data"].get("oversample_ratio", 0.5)
+    if oversample:
+        print("[8b] Oversampling minority classes...")
+        X_tr, s_tr, r_tr, c_tr = oversample_minority_classes(
+            X_tr, s_tr, r_tr, c_tr,
+            target_ratio=oversample_ratio,
+            random_seed=random_seed
+        )
 
     print("[8/9] Building validation windows...")
     X_val, s_val, r_val, c_val = build_windows(
