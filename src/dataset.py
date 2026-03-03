@@ -56,6 +56,68 @@ def load_config(config_path: str = "configs/config.yaml") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Auto-download from Hugging Face
+# ---------------------------------------------------------------------------
+
+HF_REPO_ID = "lvictoria/pdm"
+
+CMAPSS_FILES = [
+    "train_FD001.txt", "train_FD002.txt",
+    "train_FD003.txt", "train_FD004.txt",
+    "test_FD001.txt",  "test_FD002.txt",
+    "test_FD003.txt",  "test_FD004.txt",
+    "RUL_FD001.txt",   "RUL_FD002.txt",
+    "RUL_FD003.txt",   "RUL_FD004.txt"
+]
+
+
+def download_from_huggingface(raw_dir: str = "data/raw") -> None:
+    """
+    Auto-download CMAPSS files from Hugging Face if not already present.
+    Files are at root level in lvictoria/pdm.
+
+    Only downloads missing files — safe to call every run.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise ImportError(
+            "huggingface_hub not installed. "
+            "Run: pip install huggingface_hub"
+        )
+
+    os.makedirs(raw_dir, exist_ok=True)
+
+    missing = [
+        f for f in CMAPSS_FILES
+        if not (Path(raw_dir) / f).exists()
+    ]
+
+    if not missing:
+        print(f"[INFO] All CMAPSS files already in {raw_dir}/")
+        return
+
+    print(f"[INFO] Downloading {len(missing)} files from "
+          f"Hugging Face ({HF_REPO_ID})...")
+
+    for filename in missing:
+        print(f"  → {filename}")
+        local_path = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=filename,       # files are at root level
+            repo_type="dataset",
+            local_dir=raw_dir
+        )
+        # hf_hub_download saves to a cache subdir — move to raw_dir directly
+        target = Path(raw_dir) / filename
+        if not target.exists():
+            import shutil
+            shutil.copy(local_path, target)
+
+    print(f"[✓] All CMAPSS files downloaded to {raw_dir}/")
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Load raw CMAPSS files
 # ---------------------------------------------------------------------------
 
@@ -554,6 +616,10 @@ def preprocess(
     random_seed = cfg["data"]["random_seed"]
     n_clusters  = cfg["data"]["n_clusters"]
     batch_size  = cfg["training"]["batch_size"]
+
+
+    # ── Auto-download from Hugging Face if files missing ──────────────────
+    download_from_huggingface(raw_dir)
 
     # ── Step 1: Load ──────────────────────────────────────────────────────
     print("[1/9] Loading CMAPSS subsets...")
