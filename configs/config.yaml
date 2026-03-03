@@ -46,7 +46,9 @@ training:
   focal_gamma: 2.0
   patience: 15
   min_delta: 0.001
-  lr_scheduler: cosine
+  lr_scheduler: plateau
+  lr_factor: 0.5
+  lr_patience: 5
   lr_min: 1.0e-05
 inference:
   mc_passes: 50
