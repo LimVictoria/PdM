@@ -26,10 +26,12 @@ data:
   class_weight_override: [0.5, 1.0, 1.5, 2.0]
   #                        ↑    ↑    ↑    ↑
   #                      Hlthy Deg Warn Critical
+  #                        ↑    ↑    ↑    ↑
+  #                      Hlthy Deg Warn Critical
 
   # Oversampling — duplicate minority class windows
   # Safe for time series (no synthetic data)
-  oversample: true
+  oversample: false
   oversample_ratio: 0.3   # minority gets 50% of majority count
 
   # Operating condition clustering
