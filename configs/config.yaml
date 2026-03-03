@@ -23,9 +23,8 @@ data:
   # Class weight override
   # Manually force Critical (class 3) to have highest weight
   # Comment out to use automatic inverse frequency weights
-  # Weights based on inverse F1 from previous run
-  # Healthy=0.58, Degrading=0.45, Warning=0.57, Critical=0.88
-  class_weight_override: [1.5, 2.5, 2.0, 1.0]
+  # class_weight_override: [1.5, 2.5, 2.0, 1.0]  ← uncomment to override
+  # Leave commented to use automatic inverse frequency weights
   #                        ↑    ↑    ↑    ↑
   #                      Hlthy Deg Warn Critical
 
@@ -47,8 +46,8 @@ data:
 model:
   # Sequential input dim: 14 sensors + 3 op_settings
   input_dim: 17  # 14 sensors + 3 op_settings (after dropping 7 flat sensors)
-  # Static input dim: 6 clusters (one-hot) + 2 fault modes (one-hot)
-  static_dim: 8
+  # Static input dim: 3 clusters (one-hot) + 2 fault modes (one-hot) + 4 subsets (one-hot) = 9
+  static_dim: 9
   hidden_dim: 128
   num_lstm_layers: 2
   dropout: 0.3
@@ -71,13 +70,13 @@ training:
 
   # Combined loss weight
   # Loss = alpha * MSE + (1 - alpha) * FocalCE
-  alpha: 0.4  # 40% RUL, 60% classification — boost class signal
+  alpha: 0.5  # truly 50/50 with loss normalisation
 
   # Focal loss gamma
   focal_gamma: 2.0
 
   # Early stopping
-  patience: 10
+  patience: 15
   min_delta: 0.001
 
   # LR scheduler
