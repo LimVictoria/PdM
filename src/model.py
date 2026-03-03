@@ -420,26 +420,31 @@ class CMAPSS_CNN_LSTM(nn.Module):
 
 class CMAPSSLoss(nn.Module):
     """
-    Combined loss with automatic loss normalisation.
+    Combined loss: alpha * MSE_RUL + (1-alpha) * FocalCE
 
     Problem without normalisation:
-        MSE   ~ 200-400  (raw RUL scale, cycles squared)
-        Focal ~ 0.5-2.0  (log probability scale)
+        MSE   ~ 200-400  (cycles squared)
+        Focal ~ 0.5-2.0  (log probability)
         MSE dominates 99% of gradient → FocalCE ignored
 
-    Solution — normalise each loss to scale ~1.0:
-        mse_norm   = mse   / mse.detach()    → always 1.0
-        focal_norm = focal / focal.detach()  → always 1.0
-        total = alpha * 1.0 + (1-alpha) * 1.0
+    Fix — divide by fixed scale constants:
+        mse_norm   = mse   / 625.0   (25 cycles RMSE squared)
+        focal_norm = focal / 1.5     (log(4 classes))
+        total = alpha * mse_norm + (1-alpha) * focal_norm
 
-        Now alpha=0.5 truly means 50/50
-        Both losses contribute equally to learning
+    Why fixed constants:
+        EMA running averages drift as computation graph nodes
+        causing normalised loss to INCREASE every epoch
+        Fixed constants are stable, predictable, correct
 
     Args:
         class_weights:  Per-class weights for focal loss
-        alpha:          True weight for RUL vs classification (0.0-1.0)
+        alpha:          Weight for RUL regression (0=only class, 1=only RUL)
         gamma:          Focal loss focusing parameter
     """
+
+    MSE_SCALE   = 625.0   # 25² — typical RMSE target squared
+    FOCAL_SCALE = 1.5     # log(4) ≈ 1.39 for uniform 4-class
 
     def __init__(
         self,
@@ -452,13 +457,6 @@ class CMAPSSLoss(nn.Module):
         self.mse_loss   = nn.MSELoss()
         self.focal_loss = FocalLoss(class_weights=class_weights, gamma=gamma)
 
-        # Running averages for loss normalisation
-        # Initialised to None, updated on first forward pass
-        self.register_buffer("mse_running",   torch.tensor(1.0))
-        self.register_buffer("focal_running", torch.tensor(1.0))
-        self.register_buffer("n_updates",     torch.tensor(0.0))
-        self.momentum = 0.99   # EMA momentum
-
     def forward(
         self,
         rul_pred:     torch.Tensor,
@@ -468,32 +466,17 @@ class CMAPSSLoss(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
-            total_loss: alpha * mse_norm + (1-alpha) * focal_norm
-            mse:        raw RUL MSE (for logging)
-            focal:      raw classification focal loss (for logging)
+            total_loss: combined normalised loss (scale ~1.0)
+            mse:        raw MSE in cycles² (for RMSE logging)
+            focal:      raw focal CE (for logging)
         """
         mse   = self.mse_loss(rul_pred.squeeze(-1), rul_target)
         focal = self.focal_loss(class_logits, class_target)
 
-        # Update running averages (only during training)
-        if self.training:
-            self.n_updates += 1
-            if self.n_updates == 1:
-                # First batch — initialise with actual values
-                self.mse_running.fill_(mse.detach().item())
-                self.focal_running.fill_(focal.detach().item())
-            else:
-                # Exponential moving average
-                self.mse_running   = (self.momentum * self.mse_running
-                                      + (1 - self.momentum) * mse.detach())
-                self.focal_running = (self.momentum * self.focal_running
-                                      + (1 - self.momentum) * focal.detach())
+        mse_norm   = mse   / self.MSE_SCALE
+        focal_norm = focal / self.FOCAL_SCALE
 
-        # Normalise each loss to scale ~1.0
-        mse_norm   = mse   / (self.mse_running   + 1e-8)
-        focal_norm = focal / (self.focal_running + 1e-8)
-
-        total = self.alpha * mse_norm + (1 - self.alpha) * focal_norm
+        total = self.alpha * mse_norm + (1.0 - self.alpha) * focal_norm
 
         return total, mse, focal
 
