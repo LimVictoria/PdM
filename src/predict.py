@@ -313,7 +313,7 @@ if __name__ == "__main__":
 
     # Load model
     model = build_model().to(device)
-    checkpoint = torch.load("artifacts/best_model.pt", map_location=device)
+    checkpoint = torch.load("artifacts/best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
     print(f"[INFO] Loaded model from epoch {checkpoint['epoch']}")
 
