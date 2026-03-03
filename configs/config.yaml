@@ -12,12 +12,13 @@ data:
   # Increase if too few dropped, decrease if too many
   flat_sensor_percentile: 30.0
 
-  # Class boundaries
+  # Class boundaries (relative to rul_cap=125)
+  # Must ensure all 4 classes appear in training data
   class_bins:
-    healthy: 125       # RUL > 125
-    degrading: 75      # 75 < RUL <= 125
-    warning: 25        # 25 < RUL <= 75
-    critical: 0        # RUL <= 25
+    healthy: 75        # RUL >= 75  → Class 0 (Healthy)
+    degrading: 50      # RUL >= 50  → Class 1 (Degrading)
+    warning: 25        # RUL >= 25  → Class 2 (Warning)
+    critical: 0        # RUL < 25   → Class 3 (Critical)
 
   # Operating condition clustering
   n_clusters: 3  # FD001/FD003 have 1 condition, FD002/FD004 have 6 but cluster to ~3
