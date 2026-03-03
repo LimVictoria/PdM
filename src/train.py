@@ -4,7 +4,7 @@ train.py
 Full training loop with:
     - DagsHub / MLflow experiment tracking (works from Colab/Kaggle/anywhere)
     - Early stopping
-    - Cosine LR scheduler
+    - ReduceLROnPlateau scheduler
     - Gradient clipping
     - Per-epoch metrics (RMSE, MAE, class accuracy, per-class recall)
     - Model checkpointing
@@ -19,7 +19,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-# from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -51,19 +50,13 @@ def load_config(config_path: str = "configs/config.yaml") -> dict:
 # ---------------------------------------------------------------------------
 
 def detect_environment() -> str:
-    """
-    Detect where the code is running.
-    Returns: 'colab', 'kaggle', or 'local'
-    """
     try:
         import google.colab
         return "colab"
     except ImportError:
         pass
-
     if os.path.exists("/kaggle/working"):
         return "kaggle"
-
     return "local"
 
 
@@ -72,10 +65,6 @@ def detect_environment() -> str:
 # ---------------------------------------------------------------------------
 
 def mount_google_drive() -> Optional[str]:
-    """
-    Mount Google Drive in Colab.
-    Returns the drive path if successful, None otherwise.
-    """
     try:
         from google.colab import drive
         drive.mount("/content/drive")
@@ -88,75 +77,41 @@ def mount_google_drive() -> Optional[str]:
         return None
 
 
-def save_to_google_drive(
-    artifacts_dir: str,
-    drive_path: str
-) -> None:
-    """
-    Copy all artifacts to Google Drive after training.
-    Saves: best_model.pt, preprocessing.pkl, config.yaml
-    """
+def save_to_google_drive(artifacts_dir: str, drive_path: str) -> None:
     print(f"\n[INFO] Saving artifacts to Google Drive...")
     os.makedirs(drive_path, exist_ok=True)
-
     files_to_save = [
         "artifacts/best_model.pt",
         "artifacts/preprocessing.pkl",
         "configs/config.yaml"
     ]
-
     for f in files_to_save:
         src = Path(f)
         if src.exists():
             dst = Path(drive_path) / src.name
             shutil.copy(src, dst)
             print(f"  → Saved {src.name} to {drive_path}")
-
     print(f"[✓] Artifacts saved to Google Drive: {drive_path}")
-    print(f"    Next session: load from {drive_path}/best_model.pt")
 
 
-def load_from_google_drive(
-    drive_path: str,
-    artifacts_dir: str = "artifacts"
-) -> bool:
-    """
-    Load previously saved model from Google Drive.
-    Returns True if model found and loaded.
-    """
+def load_from_google_drive(drive_path: str, artifacts_dir: str = "artifacts") -> bool:
     model_path = Path(drive_path) / "best_model.pt"
     if not model_path.exists():
         return False
-
     os.makedirs(artifacts_dir, exist_ok=True)
     shutil.copy(model_path, Path(artifacts_dir) / "best_model.pt")
-
     pkl_path = Path(drive_path) / "preprocessing.pkl"
     if pkl_path.exists():
         shutil.copy(pkl_path, Path(artifacts_dir) / "preprocessing.pkl")
-
     print(f"[INFO] Loaded previous model from Google Drive: {drive_path}")
     return True
 
 
 # ---------------------------------------------------------------------------
-# MLflow setup — supports DagsHub, local, or basic remote
+# MLflow setup
 # ---------------------------------------------------------------------------
 
 def setup_mlflow(mlcfg: dict, env: str) -> None:
-    """
-    Configure MLflow tracking URI based on environment.
-
-    Priority:
-        1. DagsHub (if dagshub config present) — works everywhere
-        2. Local mlruns/ — works on local machine
-        3. Fallback: local mlruns/
-
-    To use DagsHub, add to config.yaml:
-        mlflow:
-          dagshub_user: LimVictoria
-          dagshub_repo: PdM
-    """
     dagshub_user = mlcfg.get("dagshub_user", None)
     dagshub_repo = mlcfg.get("dagshub_repo", None)
 
@@ -168,34 +123,25 @@ def setup_mlflow(mlcfg: dict, env: str) -> None:
                 repo_name=dagshub_repo,
                 mlflow=True
             )
-            print(f"[INFO] MLflow → DagsHub: "
-                  f"dagshub.com/{dagshub_user}/{dagshub_repo}")
+            print(f"[INFO] MLflow → DagsHub: dagshub.com/{dagshub_user}/{dagshub_repo}")
             return
         except ImportError:
-            print("[WARNING] dagshub not installed. "
-                  "Run: pip install dagshub")
+            print("[WARNING] dagshub not installed. Run: pip install dagshub")
         except Exception as e:
             print(f"[WARNING] DagsHub init failed: {e}")
 
-    # Fallback — local mlruns/
     mlflow.set_tracking_uri(mlcfg.get("tracking_uri", "mlruns"))
-
     if env in ("colab", "kaggle"):
-        print("[INFO] MLflow → local mlruns/ "
-              "(add dagshub config to view remotely)")
+        print("[INFO] MLflow → local mlruns/ (add dagshub config to view remotely)")
     else:
-        print("[INFO] MLflow → local mlruns/  "
-              "View with: mlflow ui --port 5000")
+        print("[INFO] MLflow → local mlruns/  View with: mlflow ui --port 5000")
 
 
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_rul_metrics(
-    preds: np.ndarray,
-    targets: np.ndarray
-) -> Dict[str, float]:
+def compute_rul_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
     errors = preds - targets
     rmse   = np.sqrt(np.mean(errors ** 2))
     mae    = np.mean(np.abs(errors))
@@ -212,8 +158,8 @@ def compute_class_metrics(
     targets: np.ndarray,
     num_classes: int = 4
 ) -> Dict[str, float]:
-    accuracy   = (preds == targets).mean()
-    cm         = confusion_matrix(targets, preds, labels=list(range(num_classes)))
+    accuracy    = (preds == targets).mean()
+    cm          = confusion_matrix(targets, preds, labels=list(range(num_classes)))
     class_names = ["healthy", "degrading", "warning", "critical"]
 
     per_class_recall = {}
@@ -248,9 +194,9 @@ def run_epoch(
     model.train() if training else model.eval()
 
     total_loss_sum = mse_sum = focal_sum = 0.0
-    all_rul_preds = []
-    all_rul_targets = []
-    all_class_preds = []
+    all_rul_preds    = []
+    all_rul_targets  = []
+    all_class_preds  = []
     all_class_targets = []
 
     context = torch.enable_grad() if training else torch.no_grad()
@@ -263,9 +209,7 @@ def run_epoch(
             y_class = y_class.to(device)
 
             rul_pred, class_logits, _, _ = model(X, static)
-            total, mse, focal = criterion(
-                rul_pred, y_rul, class_logits, y_class
-            )
+            total, mse, focal = criterion(rul_pred, y_rul, class_logits, y_class)
 
             if training:
                 optimizer.zero_grad()
@@ -279,9 +223,7 @@ def run_epoch(
 
             all_rul_preds.append(rul_pred.squeeze(-1).detach().cpu().numpy())
             all_rul_targets.append(y_rul.detach().cpu().numpy())
-            all_class_preds.append(
-                class_logits.argmax(dim=-1).detach().cpu().numpy()
-            )
+            all_class_preds.append(class_logits.argmax(dim=-1).detach().cpu().numpy())
             all_class_targets.append(y_class.detach().cpu().numpy())
 
     n = len(loader)
@@ -337,7 +279,7 @@ def train(config_path: str = "configs/config.yaml"):
     mlcfg = cfg["mlflow"]
 
     # ── Detect environment ────────────────────────────────────────────────
-    env = detect_environment()
+    env    = detect_environment()
     print(f"[INFO] Running on: {env.upper()}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -370,13 +312,14 @@ def train(config_path: str = "configs/config.yaml"):
         weight_decay=tcfg["weight_decay"]
     )
 
-    if tcfg["lr_scheduler"] == "cosine":
+    lr_scheduler_name = tcfg.get("lr_scheduler", "plateau")
+    if lr_scheduler_name == "cosine":
         scheduler = CosineAnnealingLR(
             optimizer,
             T_max=tcfg["epochs"],
             eta_min=tcfg["lr_min"]
         )
-    elif tcfg["lr_scheduler"] == "plateau":
+    elif lr_scheduler_name == "plateau":
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode="min",
@@ -387,11 +330,16 @@ def train(config_path: str = "configs/config.yaml"):
     else:
         scheduler = StepLR(optimizer, step_size=30, gamma=0.5)
 
+    early_stopping  = EarlyStopping(
+        patience=tcfg["patience"],
+        min_delta=tcfg["min_delta"]
+    )
+
     best_val_loss   = float("inf")
     best_model_path = "artifacts/best_model.pt"
     os.makedirs("artifacts", exist_ok=True)
 
-    # ── Training ──────────────────────────────────────────────────────────
+    # ── Training loop ─────────────────────────────────────────────────────
     with mlflow.start_run():
 
         mlflow.log_params({
@@ -417,18 +365,23 @@ def train(config_path: str = "configs/config.yaml"):
         for epoch in range(1, tcfg["epochs"] + 1):
             t_start = time.time()
 
+            # ── Train ─────────────────────────────────────────────────────
             train_losses, tr_rul_p, tr_rul_t, tr_cls_p, tr_cls_t = run_epoch(
                 model, train_loader, criterion, optimizer, device, training=True
             )
-            if tcfg["lr_scheduler"] == "plateau":
-                scheduler.step(val_losses["total_loss"])
-            else:
-                scheduler.step()
 
+            # ── Validate ──────────────────────────────────────────────────
             val_losses, val_rul_p, val_rul_t, val_cls_p, val_cls_t = run_epoch(
                 model, val_loader, criterion, None, device, training=False
             )
 
+            # ── Step scheduler AFTER validation ───────────────────────────
+            if lr_scheduler_name == "plateau":
+                scheduler.step(val_losses["total_loss"])
+            else:
+                scheduler.step()
+
+            # ── Compute metrics ───────────────────────────────────────────
             train_rul = compute_rul_metrics(tr_rul_p,  tr_rul_t)
             val_rul   = compute_rul_metrics(val_rul_p, val_rul_t)
             train_cls = compute_class_metrics(tr_cls_p,  tr_cls_t)
@@ -461,7 +414,7 @@ def train(config_path: str = "configs/config.yaml"):
                 f"Critical: {val_cls['recall_critical']:.3f}"
             )
 
-            # Checkpoint best model
+            # ── Checkpoint ────────────────────────────────────────────────
             if val_losses["total_loss"] < best_val_loss:
                 best_val_loss = val_losses["total_loss"]
                 torch.save({
@@ -526,13 +479,13 @@ def train(config_path: str = "configs/config.yaml"):
     if env == "colab" and drive_path:
         save_to_google_drive("artifacts", drive_path)
     elif env == "kaggle":
-        # Kaggle has persistent /kaggle/working — already saved there
         print(f"[INFO] Model saved at: artifacts/best_model.pt")
         print(f"       Download from Kaggle output tab.")
     else:
         print(f"[INFO] Model saved at: artifacts/best_model.pt")
 
     return model, artifacts
+
 
 # ---------------------------------------------------------------------------
 # Entry point
