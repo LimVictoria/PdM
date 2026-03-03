@@ -23,8 +23,9 @@ data:
   # Class weight override
   # Manually force Critical (class 3) to have highest weight
   # Comment out to use automatic inverse frequency weights
-  # class_weight_override: [0.5, 1.0, 1.5, 2.0]  ← uncomment to override
-  # Leave commented to use automatic inverse frequency weights
+  # Weights based on inverse F1 from previous run
+  # Healthy=0.58, Degrading=0.45, Warning=0.57, Critical=0.88
+  class_weight_override: [1.5, 2.5, 2.0, 1.0]
   #                        ↑    ↑    ↑    ↑
   #                      Hlthy Deg Warn Critical
 
@@ -63,20 +64,20 @@ model:
   num_classes: 4
 
 training:
-  epochs: 100
+  epochs: 50
   batch_size: 128
   learning_rate: 0.0003
   weight_decay: 0.0001
 
   # Combined loss weight
   # Loss = alpha * MSE + (1 - alpha) * FocalCE
-  alpha: 0.5  # truly 50/50 now that losses are normalised
+  alpha: 0.4  # 40% RUL, 60% classification — boost class signal
 
   # Focal loss gamma
   focal_gamma: 2.0
 
   # Early stopping
-  patience: 20
+  patience: 10
   min_delta: 0.001
 
   # LR scheduler
