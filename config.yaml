@@ -1,0 +1,82 @@
+data:
+  raw_dir: "data/raw"
+  subsets: ["FD001", "FD002", "FD003", "FD004"]
+  window_size: 30
+  rul_cap: 125
+  val_split: 0.2
+  random_seed: 42
+
+  # Sensors to drop (near-zero variance)
+  drop_sensors: [1, 5, 6, 10, 16, 18, 19]
+
+  # Class boundaries
+  class_bins:
+    healthy: 125       # RUL > 125
+    degrading: 75      # 75 < RUL <= 125
+    warning: 25        # 25 < RUL <= 75
+    critical: 0        # RUL <= 25
+
+  # Operating condition clustering
+  n_clusters: 6
+
+  # Fault mode per subset
+  fault_modes:
+    FD001: 0
+    FD002: 0
+    FD003: 1
+    FD004: 1
+
+model:
+  # Sequential input dim: 14 sensors + 3 op_settings
+  input_dim: 17
+  # Static input dim: 6 clusters (one-hot) + 2 fault modes (one-hot)
+  static_dim: 8
+  hidden_dim: 128
+  num_lstm_layers: 2
+  dropout: 0.3
+
+  # Multi-scale CNN kernels
+  cnn_kernels: [3, 5, 7]
+  cnn_out_channels: 64
+
+  # Attention
+  attention_dim: 64
+
+  # Dual head
+  num_classes: 4
+
+training:
+  epochs: 100
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+  # Combined loss weight
+  # Loss = alpha * MSE + (1 - alpha) * FocalCE
+  alpha: 0.5
+
+  # Focal loss gamma
+  focal_gamma: 2.0
+
+  # Early stopping
+  patience: 15
+  min_delta: 0.001
+
+  # LR scheduler
+  lr_scheduler: "cosine"   # cosine or step
+  lr_min: 0.00001
+
+inference:
+  # MC Dropout passes for uncertainty
+  mc_passes: 50
+
+  # Recursive window size matches training
+  window_size: 30
+
+mlflow:
+  experiment_name: "cmapss_rul_prediction"
+  tracking_uri: "mlruns"
+
+api:
+  host: "0.0.0.0"
+  port: 8000
