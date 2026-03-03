@@ -476,7 +476,7 @@ def train(config_path: str = "configs/config.yaml"):
         print("Test set evaluation")
         print(f"{'='*60}")
 
-        checkpoint = torch.load(best_model_path, map_location=device)
+        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
 
         _, te_rul_p, te_rul_t, te_cls_p, te_cls_t = run_epoch(
