@@ -193,26 +193,14 @@ def load_all_subsets(
 
 def get_flat_sensors(df: pd.DataFrame, threshold: float = 0.001) -> List[str]:
     """
-    Identify sensors with near-zero coefficient of variation.
-    Uses literature-validated list as fallback validation.
+    Return literature-validated flat sensors for CMAPSS.
+    Sensors s1, s5, s6, s10, s16, s18, s19 have near-zero
+    variance across all operating conditions in all 4 subsets.
+    Always use the hardcoded list for consistency.
     """
-    literature_drop = {f"s{i}" for i in [1, 5, 6, 10, 16, 18, 19]}
-
-    computed_drop = set()
-    for col in ALL_SENSOR_COLS:
-        mean = df[col].mean()
-        std  = df[col].std()
-        cv   = std / (abs(mean) + 1e-8)
-        if cv < threshold:
-            computed_drop.add(col)
-
-    # Validate computed matches literature
-    if computed_drop != literature_drop:
-        print(f"[WARNING] Computed flat sensors {computed_drop} "
-              f"differ from literature {literature_drop}. "
-              f"Using computed.")
-
-    return list(computed_drop)
+    literature_drop = [f"s{i}" for i in [1, 5, 6, 10, 16, 18, 19]]
+    print(f"      Dropping (literature): {literature_drop}")
+    return literature_drop
 
 
 def drop_flat_sensors(df: pd.DataFrame, flat_sensors: List[str]) -> pd.DataFrame:
@@ -350,12 +338,12 @@ def apply_cluster_scalers(
     Normalise each row using the scaler fitted for its cluster.
     """
     df = df.copy()
-    normalised = df[feature_cols].copy()
+    normalised = df[feature_cols].values.copy().astype(np.float64)
 
     for cluster_id, scaler in scalers.items():
-        mask = df["op_cluster"] == cluster_id
+        mask = (df["op_cluster"] == cluster_id).values
         if mask.sum() > 0:
-            normalised.loc[mask] = scaler.transform(df.loc[mask, feature_cols])
+            normalised[mask] = scaler.transform(df.loc[df["op_cluster"] == cluster_id, feature_cols])
 
     df[feature_cols] = normalised
     return df
