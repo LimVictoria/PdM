@@ -6,8 +6,11 @@ data:
   val_split: 0.2
   random_seed: 42
 
-  # Sensors to drop (near-zero variance)
-  drop_sensors: [1, 5, 6, 10, 16, 18, 19]
+  # Flat sensor detection
+  # Drops sensors in bottom N% of variance — scale invariant
+  # 30.0 correctly identifies the 7 flat sensors in CMAPSS
+  # Increase if too few dropped, decrease if too many
+  flat_sensor_percentile: 30.0
 
   # Class boundaries
   class_bins:
