@@ -17,7 +17,7 @@ data:
     critical: 0        # RUL <= 25
 
   # Operating condition clustering
-  n_clusters: 6
+  n_clusters: 3  # FD001/FD003 have 1 condition, FD002/FD004 have 6 but cluster to ~3
 
   # Fault mode per subset
   fault_modes:
@@ -28,7 +28,7 @@ data:
 
 model:
   # Sequential input dim: 14 sensors + 3 op_settings
-  input_dim: 17
+  input_dim: 17  # 14 sensors + 3 op_settings (after dropping 7 flat sensors)
   # Static input dim: 6 clusters (one-hot) + 2 fault modes (one-hot)
   static_dim: 8
   hidden_dim: 128
