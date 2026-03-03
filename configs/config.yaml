@@ -51,19 +51,19 @@ model:
 
 training:
   epochs: 100
-  batch_size: 256
-  learning_rate: 0.001
+  batch_size: 128
+  learning_rate: 0.0003
   weight_decay: 0.0001
 
   # Combined loss weight
   # Loss = alpha * MSE + (1 - alpha) * FocalCE
-  alpha: 0.5
+  alpha: 0.7
 
   # Focal loss gamma
   focal_gamma: 2.0
 
   # Early stopping
-  patience: 15
+  patience: 20
   min_delta: 0.001
 
   # LR scheduler
