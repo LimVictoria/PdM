@@ -2,16 +2,19 @@
 train.py
 --------
 Full training loop with:
-    - MLflow experiment tracking
+    - DagsHub / MLflow experiment tracking (works from Colab/Kaggle/anywhere)
     - Early stopping
     - Cosine LR scheduler
     - Gradient clipping
     - Per-epoch metrics (RMSE, MAE, class accuracy, per-class recall)
     - Model checkpointing
+    - Auto Google Drive saving (when running in Colab)
+    - Auto Hugging Face model saving (optional)
 """
 
 import os
 import time
+import shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -43,6 +46,148 @@ def load_config(config_path: str = "configs/config.yaml") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Detect runtime environment
+# ---------------------------------------------------------------------------
+
+def detect_environment() -> str:
+    """
+    Detect where the code is running.
+    Returns: 'colab', 'kaggle', or 'local'
+    """
+    try:
+        import google.colab
+        return "colab"
+    except ImportError:
+        pass
+
+    if os.path.exists("/kaggle/working"):
+        return "kaggle"
+
+    return "local"
+
+
+# ---------------------------------------------------------------------------
+# Google Drive saving
+# ---------------------------------------------------------------------------
+
+def mount_google_drive() -> Optional[str]:
+    """
+    Mount Google Drive in Colab.
+    Returns the drive path if successful, None otherwise.
+    """
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive")
+        drive_path = "/content/drive/MyDrive/cmapss-rul"
+        os.makedirs(drive_path, exist_ok=True)
+        print(f"[INFO] Google Drive mounted at {drive_path}")
+        return drive_path
+    except Exception as e:
+        print(f"[WARNING] Could not mount Google Drive: {e}")
+        return None
+
+
+def save_to_google_drive(
+    artifacts_dir: str,
+    drive_path: str
+) -> None:
+    """
+    Copy all artifacts to Google Drive after training.
+    Saves: best_model.pt, preprocessing.pkl, config.yaml
+    """
+    print(f"\n[INFO] Saving artifacts to Google Drive...")
+    os.makedirs(drive_path, exist_ok=True)
+
+    files_to_save = [
+        "artifacts/best_model.pt",
+        "artifacts/preprocessing.pkl",
+        "configs/config.yaml"
+    ]
+
+    for f in files_to_save:
+        src = Path(f)
+        if src.exists():
+            dst = Path(drive_path) / src.name
+            shutil.copy(src, dst)
+            print(f"  → Saved {src.name} to {drive_path}")
+
+    print(f"[✓] Artifacts saved to Google Drive: {drive_path}")
+    print(f"    Next session: load from {drive_path}/best_model.pt")
+
+
+def load_from_google_drive(
+    drive_path: str,
+    artifacts_dir: str = "artifacts"
+) -> bool:
+    """
+    Load previously saved model from Google Drive.
+    Returns True if model found and loaded.
+    """
+    model_path = Path(drive_path) / "best_model.pt"
+    if not model_path.exists():
+        return False
+
+    os.makedirs(artifacts_dir, exist_ok=True)
+    shutil.copy(model_path, Path(artifacts_dir) / "best_model.pt")
+
+    pkl_path = Path(drive_path) / "preprocessing.pkl"
+    if pkl_path.exists():
+        shutil.copy(pkl_path, Path(artifacts_dir) / "preprocessing.pkl")
+
+    print(f"[INFO] Loaded previous model from Google Drive: {drive_path}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# MLflow setup — supports DagsHub, local, or basic remote
+# ---------------------------------------------------------------------------
+
+def setup_mlflow(mlcfg: dict, env: str) -> None:
+    """
+    Configure MLflow tracking URI based on environment.
+
+    Priority:
+        1. DagsHub (if dagshub config present) — works everywhere
+        2. Local mlruns/ — works on local machine
+        3. Fallback: local mlruns/
+
+    To use DagsHub, add to config.yaml:
+        mlflow:
+          dagshub_user: LimVictoria
+          dagshub_repo: PdM
+    """
+    dagshub_user = mlcfg.get("dagshub_user", None)
+    dagshub_repo = mlcfg.get("dagshub_repo", None)
+
+    if dagshub_user and dagshub_repo:
+        try:
+            import dagshub
+            dagshub.init(
+                repo_owner=dagshub_user,
+                repo_name=dagshub_repo,
+                mlflow=True
+            )
+            print(f"[INFO] MLflow → DagsHub: "
+                  f"dagshub.com/{dagshub_user}/{dagshub_repo}")
+            return
+        except ImportError:
+            print("[WARNING] dagshub not installed. "
+                  "Run: pip install dagshub")
+        except Exception as e:
+            print(f"[WARNING] DagsHub init failed: {e}")
+
+    # Fallback — local mlruns/
+    mlflow.set_tracking_uri(mlcfg.get("tracking_uri", "mlruns"))
+
+    if env in ("colab", "kaggle"):
+        print("[INFO] MLflow → local mlruns/ "
+              "(add dagshub config to view remotely)")
+    else:
+        print("[INFO] MLflow → local mlruns/  "
+              "View with: mlflow ui --port 5000")
+
+
+# ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
@@ -50,22 +195,14 @@ def compute_rul_metrics(
     preds: np.ndarray,
     targets: np.ndarray
 ) -> Dict[str, float]:
-    """
-    RMSE, MAE, and NASA score function.
-    NASA score penalises late predictions more than early ones.
-    """
     errors = preds - targets
-
-    rmse = np.sqrt(np.mean(errors ** 2))
-    mae  = np.mean(np.abs(errors))
-
-    # NASA score function
-    score = np.sum(
+    rmse   = np.sqrt(np.mean(errors ** 2))
+    mae    = np.mean(np.abs(errors))
+    score  = np.sum(
         np.where(errors < 0,
                  np.exp(-errors / 13) - 1,
                  np.exp(errors / 10) - 1)
     )
-
     return {"rmse": rmse, "mae": mae, "nasa_score": score}
 
 
@@ -74,13 +211,11 @@ def compute_class_metrics(
     targets: np.ndarray,
     num_classes: int = 4
 ) -> Dict[str, float]:
-    """Accuracy, per-class recall, macro F1."""
-    accuracy = (preds == targets).mean()
-
-    cm = confusion_matrix(targets, preds, labels=list(range(num_classes)))
+    accuracy   = (preds == targets).mean()
+    cm         = confusion_matrix(targets, preds, labels=list(range(num_classes)))
+    class_names = ["healthy", "degrading", "warning", "critical"]
 
     per_class_recall = {}
-    class_names = ["healthy", "degrading", "warning", "critical"]
     for i, name in enumerate(class_names):
         if cm[i].sum() > 0:
             per_class_recall[f"recall_{name}"] = cm[i, i] / cm[i].sum()
@@ -89,12 +224,11 @@ def compute_class_metrics(
 
     macro_f1 = f1_score(targets, preds, average="macro", zero_division=0)
 
-    metrics = {
-        "accuracy":  float(accuracy),
-        "macro_f1":  float(macro_f1),
+    return {
+        "accuracy": float(accuracy),
+        "macro_f1": float(macro_f1),
         **{k: float(v) for k, v in per_class_recall.items()}
     }
-    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -102,45 +236,32 @@ def compute_class_metrics(
 # ---------------------------------------------------------------------------
 
 def run_epoch(
-    model:       CMAPSS_CNN_LSTM,
-    loader:      DataLoader,
-    criterion:   CMAPSSLoss,
-    optimizer:   Optional[torch.optim.Optimizer],
-    device:      torch.device,
-    training:    bool
-) -> Tuple[Dict[str, float], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Run one epoch (train or eval).
+    model:     CMAPSS_CNN_LSTM,
+    loader:    DataLoader,
+    criterion: CMAPSSLoss,
+    optimizer: Optional[torch.optim.Optimizer],
+    device:    torch.device,
+    training:  bool
+) -> Tuple[Dict, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
-    Returns:
-        metrics:        dict of loss components
-        rul_preds:      predicted RUL values
-        rul_targets:    true RUL values
-        class_preds:    predicted class indices
-        class_targets:  true class indices
-    """
     model.train() if training else model.eval()
 
-    total_loss_sum = 0.0
-    mse_sum        = 0.0
-    focal_sum      = 0.0
-
-    all_rul_preds    = []
-    all_rul_targets  = []
-    all_class_preds  = []
+    total_loss_sum = mse_sum = focal_sum = 0.0
+    all_rul_preds = []
+    all_rul_targets = []
+    all_class_preds = []
     all_class_targets = []
 
     context = torch.enable_grad() if training else torch.no_grad()
 
     with context:
         for X, static, y_rul, y_class in loader:
-            X        = X.to(device)
-            static   = static.to(device)
-            y_rul    = y_rul.to(device)
-            y_class  = y_class.to(device)
+            X       = X.to(device)
+            static  = static.to(device)
+            y_rul   = y_rul.to(device)
+            y_class = y_class.to(device)
 
             rul_pred, class_logits, _, _ = model(X, static)
-
             total, mse, focal = criterion(
                 rul_pred, y_rul, class_logits, y_class
             )
@@ -148,7 +269,6 @@ def run_epoch(
             if training:
                 optimizer.zero_grad()
                 total.backward()
-                # Gradient clipping — prevents LSTM exploding gradients
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
@@ -156,29 +276,27 @@ def run_epoch(
             mse_sum        += mse.item()
             focal_sum      += focal.item()
 
-            # Collect predictions
-            all_rul_preds.append(
-                rul_pred.squeeze(-1).detach().cpu().numpy()
-            )
+            all_rul_preds.append(rul_pred.squeeze(-1).detach().cpu().numpy())
             all_rul_targets.append(y_rul.detach().cpu().numpy())
             all_class_preds.append(
                 class_logits.argmax(dim=-1).detach().cpu().numpy()
             )
             all_class_targets.append(y_class.detach().cpu().numpy())
 
-    n_batches = len(loader)
+    n = len(loader)
     loss_metrics = {
-        "total_loss": total_loss_sum / n_batches,
-        "mse_loss":   mse_sum        / n_batches,
-        "focal_loss": focal_sum      / n_batches
+        "total_loss": total_loss_sum / n,
+        "mse_loss":   mse_sum / n,
+        "focal_loss": focal_sum / n
     }
 
-    rul_preds     = np.concatenate(all_rul_preds)
-    rul_targets   = np.concatenate(all_rul_targets)
-    class_preds   = np.concatenate(all_class_preds)
-    class_targets = np.concatenate(all_class_targets)
-
-    return loss_metrics, rul_preds, rul_targets, class_preds, class_targets
+    return (
+        loss_metrics,
+        np.concatenate(all_rul_preds),
+        np.concatenate(all_rul_targets),
+        np.concatenate(all_class_preds),
+        np.concatenate(all_class_targets)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -212,13 +330,26 @@ class EarlyStopping:
 # ---------------------------------------------------------------------------
 
 def train(config_path: str = "configs/config.yaml"):
-    cfg  = load_config(config_path)
-    tcfg = cfg["training"]
-    mcfg = cfg["model"]
+    cfg   = load_config(config_path)
+    tcfg  = cfg["training"]
+    mcfg  = cfg["model"]
     mlcfg = cfg["mlflow"]
+
+    # ── Detect environment ────────────────────────────────────────────────
+    env = detect_environment()
+    print(f"[INFO] Running on: {env.upper()}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
+
+    # ── Google Drive (Colab only) ─────────────────────────────────────────
+    drive_path = None
+    if env == "colab":
+        drive_path = mount_google_drive()
+
+    # ── MLflow setup ──────────────────────────────────────────────────────
+    setup_mlflow(mlcfg, env)
+    mlflow.set_experiment(mlcfg["experiment_name"])
 
     # ── Data ──────────────────────────────────────────────────────────────
     print("\n[INFO] Preprocessing data...")
@@ -228,10 +359,9 @@ def train(config_path: str = "configs/config.yaml"):
     class_weights = class_weights.to(device)
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = build_model(config_path).to(device)
-    print(f"\n[INFO] Model parameters: {model.count_parameters():,}")
-
+    model     = build_model(config_path).to(device)
     criterion = build_loss(class_weights, config_path).to(device)
+    print(f"[INFO] Model parameters: {model.count_parameters():,}")
 
     optimizer = Adam(
         model.parameters(),
@@ -253,95 +383,78 @@ def train(config_path: str = "configs/config.yaml"):
         min_delta=tcfg["min_delta"]
     )
 
-    # ── MLflow ────────────────────────────────────────────────────────────
-    mlflow.set_tracking_uri(mlcfg["tracking_uri"])
-    mlflow.set_experiment(mlcfg["experiment_name"])
+    best_val_loss   = float("inf")
+    best_model_path = "artifacts/best_model.pt"
+    os.makedirs("artifacts", exist_ok=True)
 
+    # ── Training ──────────────────────────────────────────────────────────
     with mlflow.start_run():
 
-        # Log config
         mlflow.log_params({
-            "epochs":         tcfg["epochs"],
-            "batch_size":     tcfg["batch_size"],
-            "learning_rate":  tcfg["learning_rate"],
-            "alpha":          tcfg["alpha"],
-            "focal_gamma":    tcfg["focal_gamma"],
-            "hidden_dim":     mcfg["hidden_dim"],
-            "num_lstm_layers":mcfg["num_lstm_layers"],
-            "dropout":        mcfg["dropout"],
-            "cnn_kernels":    str(mcfg["cnn_kernels"]),
-            "window_size":    cfg["data"]["window_size"],
-            "rul_cap":        cfg["data"]["rul_cap"],
-            "device":         str(device)
+            "epochs":          tcfg["epochs"],
+            "batch_size":      tcfg["batch_size"],
+            "learning_rate":   tcfg["learning_rate"],
+            "alpha":           tcfg["alpha"],
+            "focal_gamma":     tcfg["focal_gamma"],
+            "hidden_dim":      mcfg["hidden_dim"],
+            "num_lstm_layers": mcfg["num_lstm_layers"],
+            "dropout":         mcfg["dropout"],
+            "cnn_kernels":     str(mcfg["cnn_kernels"]),
+            "window_size":     cfg["data"]["window_size"],
+            "rul_cap":         cfg["data"]["rul_cap"],
+            "device":          str(device),
+            "environment":     env
         })
 
-        best_val_loss  = float("inf")
-        best_model_path = "artifacts/best_model.pt"
-        os.makedirs("artifacts", exist_ok=True)
-
         print(f"\n{'='*60}")
-        print(f"Starting training for {tcfg['epochs']} epochs")
+        print(f"Training for {tcfg['epochs']} epochs")
         print(f"{'='*60}\n")
 
         for epoch in range(1, tcfg["epochs"] + 1):
             t_start = time.time()
 
-            # ── Train ──────────────────────────────────────────────────────
             train_losses, tr_rul_p, tr_rul_t, tr_cls_p, tr_cls_t = run_epoch(
                 model, train_loader, criterion, optimizer, device, training=True
             )
             scheduler.step()
 
-            # ── Validate ───────────────────────────────────────────────────
             val_losses, val_rul_p, val_rul_t, val_cls_p, val_cls_t = run_epoch(
                 model, val_loader, criterion, None, device, training=False
             )
 
-            # ── Compute metrics ────────────────────────────────────────────
-            train_rul_metrics  = compute_rul_metrics(tr_rul_p,  tr_rul_t)
-            val_rul_metrics    = compute_rul_metrics(val_rul_p, val_rul_t)
-            train_cls_metrics  = compute_class_metrics(tr_cls_p,  tr_cls_t)
-            val_cls_metrics    = compute_class_metrics(val_cls_p, val_cls_t)
+            train_rul = compute_rul_metrics(tr_rul_p,  tr_rul_t)
+            val_rul   = compute_rul_metrics(val_rul_p, val_rul_t)
+            train_cls = compute_class_metrics(tr_cls_p,  tr_cls_t)
+            val_cls   = compute_class_metrics(val_cls_p, val_cls_t)
 
             elapsed = time.time() - t_start
 
-            # ── Log to MLflow ──────────────────────────────────────────────
             mlflow.log_metrics({
-                # Loss
-                "train/total_loss":  train_losses["total_loss"],
-                "train/mse_loss":    train_losses["mse_loss"],
-                "train/focal_loss":  train_losses["focal_loss"],
-                "val/total_loss":    val_losses["total_loss"],
-                "val/mse_loss":      val_losses["mse_loss"],
-                "val/focal_loss":    val_losses["focal_loss"],
-                # RUL
-                "train/rmse":        train_rul_metrics["rmse"],
-                "train/mae":         train_rul_metrics["mae"],
-                "val/rmse":          val_rul_metrics["rmse"],
-                "val/mae":           val_rul_metrics["mae"],
-                "val/nasa_score":    val_rul_metrics["nasa_score"],
-                # Classification
-                "train/accuracy":    train_cls_metrics["accuracy"],
-                "train/macro_f1":    train_cls_metrics["macro_f1"],
-                "val/accuracy":      val_cls_metrics["accuracy"],
-                "val/macro_f1":      val_cls_metrics["macro_f1"],
-                "val/recall_critical": val_cls_metrics["recall_critical"],
-                # LR
-                "learning_rate":     optimizer.param_groups[0]["lr"]
+                "train/total_loss":    train_losses["total_loss"],
+                "train/mse_loss":      train_losses["mse_loss"],
+                "val/total_loss":      val_losses["total_loss"],
+                "val/mse_loss":        val_losses["mse_loss"],
+                "train/rmse":          train_rul["rmse"],
+                "val/rmse":            val_rul["rmse"],
+                "val/mae":             val_rul["mae"],
+                "val/nasa_score":      val_rul["nasa_score"],
+                "train/accuracy":      train_cls["accuracy"],
+                "val/accuracy":        val_cls["accuracy"],
+                "val/macro_f1":        val_cls["macro_f1"],
+                "val/recall_critical": val_cls["recall_critical"],
+                "learning_rate":       optimizer.param_groups[0]["lr"]
             }, step=epoch)
 
-            # ── Print progress ─────────────────────────────────────────────
             print(
                 f"Epoch {epoch:03d}/{tcfg['epochs']} | "
-                f"Time: {elapsed:.1f}s | "
-                f"Train Loss: {train_losses['total_loss']:.4f} | "
-                f"Val Loss: {val_losses['total_loss']:.4f} | "
-                f"Val RMSE: {val_rul_metrics['rmse']:.2f} | "
-                f"Val Acc: {val_cls_metrics['accuracy']:.3f} | "
-                f"Critical Recall: {val_cls_metrics['recall_critical']:.3f}"
+                f"{elapsed:.1f}s | "
+                f"Loss: {val_losses['total_loss']:.4f} | "
+                f"RMSE: {val_rul['rmse']:.2f} | "
+                f"Acc: {val_cls['accuracy']:.3f} | "
+                f"Critical: {val_cls['recall_critical']:.3f}"
             )
 
-            # ── Checkpoint best model ──────────────────────────────────────
+            # Checkpoint best model
             if val_losses["total_loss"] < best_val_loss:
                 best_val_loss = val_losses["total_loss"]
                 torch.save({
@@ -349,73 +462,68 @@ def train(config_path: str = "configs/config.yaml"):
                     "model_state": model.state_dict(),
                     "optimizer":   optimizer.state_dict(),
                     "val_loss":    best_val_loss,
-                    "val_rmse":    val_rul_metrics["rmse"],
-                    "val_acc":     val_cls_metrics["accuracy"]
+                    "val_rmse":    val_rul["rmse"],
+                    "val_acc":     val_cls["accuracy"]
                 }, best_model_path)
-                print(f"  → New best model saved (val_loss={best_val_loss:.4f})")
+                print(f"  → Best model saved (val_loss={best_val_loss:.4f})")
 
-            # ── Early stopping ─────────────────────────────────────────────
             if early_stopping(val_losses["total_loss"]):
                 print(f"\n[INFO] Early stopping at epoch {epoch}")
                 break
 
-        # ── Final evaluation on test set ───────────────────────────────────
+        # ── Test evaluation ────────────────────────────────────────────────
         print(f"\n{'='*60}")
-        print("Final evaluation on test set")
+        print("Test set evaluation")
         print(f"{'='*60}")
 
-        # Load best model
         checkpoint = torch.load(best_model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state"])
 
-        test_losses, te_rul_p, te_rul_t, te_cls_p, te_cls_t = run_epoch(
+        _, te_rul_p, te_rul_t, te_cls_p, te_cls_t = run_epoch(
             model, test_loader, criterion, None, device, training=False
         )
 
-        test_rul_metrics  = compute_rul_metrics(te_rul_p, te_rul_t)
-        test_cls_metrics  = compute_class_metrics(te_cls_p, te_cls_t)
+        test_rul = compute_rul_metrics(te_rul_p, te_rul_t)
+        test_cls = compute_class_metrics(te_cls_p, te_cls_t)
 
-        print(f"\nTest RUL metrics:")
-        print(f"  RMSE:       {test_rul_metrics['rmse']:.4f}")
-        print(f"  MAE:        {test_rul_metrics['mae']:.4f}")
-        print(f"  NASA Score: {test_rul_metrics['nasa_score']:.2f}")
+        print(f"\n  RMSE:            {test_rul['rmse']:.4f}")
+        print(f"  MAE:             {test_rul['mae']:.4f}")
+        print(f"  NASA Score:      {test_rul['nasa_score']:.2f}")
+        print(f"  Accuracy:        {test_cls['accuracy']:.4f}")
+        print(f"  Macro F1:        {test_cls['macro_f1']:.4f}")
+        print(f"  Critical Recall: {test_cls['recall_critical']:.4f}")
+        print(f"\n{classification_report(te_cls_t, te_cls_p, target_names=['Healthy','Degrading','Warning','Critical'])}")
 
-        print(f"\nTest classification metrics:")
-        print(f"  Accuracy:   {test_cls_metrics['accuracy']:.4f}")
-        print(f"  Macro F1:   {test_cls_metrics['macro_f1']:.4f}")
-        print(f"  Critical recall: {test_cls_metrics['recall_critical']:.4f}")
-
-        print(f"\nClassification report:")
-        class_names = ["Healthy", "Degrading", "Warning", "Critical"]
-        print(classification_report(te_cls_t, te_cls_p,
-                                    target_names=class_names))
-
-        # Log final test metrics
         mlflow.log_metrics({
-            "test/rmse":            test_rul_metrics["rmse"],
-            "test/mae":             test_rul_metrics["mae"],
-            "test/nasa_score":      test_rul_metrics["nasa_score"],
-            "test/accuracy":        test_cls_metrics["accuracy"],
-            "test/macro_f1":        test_cls_metrics["macro_f1"],
-            "test/recall_critical": test_cls_metrics["recall_critical"]
+            "test/rmse":            test_rul["rmse"],
+            "test/mae":             test_rul["mae"],
+            "test/nasa_score":      test_rul["nasa_score"],
+            "test/accuracy":        test_cls["accuracy"],
+            "test/macro_f1":        test_cls["macro_f1"],
+            "test/recall_critical": test_cls["recall_critical"]
         })
 
-        # Log model to MLflow registry
         mlflow.pytorch.log_model(
             model,
             artifact_path="model",
             registered_model_name="cmapss_cnn_lstm"
         )
-
-        # Log preprocessing artifacts
         mlflow.log_artifact("artifacts/preprocessing.pkl")
         mlflow.log_artifact("artifacts/best_model.pt")
         mlflow.log_artifact(config_path)
 
         run_id = mlflow.active_run().info.run_id
-        print(f"\n[✓] Training complete.")
-        print(f"    MLflow run ID: {run_id}")
-        print(f"    View results:  mlflow ui --port 5000")
+        print(f"\n[✓] Training complete. MLflow run ID: {run_id}")
+
+    # ── Save to Google Drive (Colab only) ──────────────────────────────────
+    if env == "colab" and drive_path:
+        save_to_google_drive("artifacts", drive_path)
+    elif env == "kaggle":
+        # Kaggle has persistent /kaggle/working — already saved there
+        print(f"[INFO] Model saved at: artifacts/best_model.pt")
+        print(f"       Download from Kaggle output tab.")
+    else:
+        print(f"[INFO] Model saved at: artifacts/best_model.pt")
 
     return model, artifacts
 
