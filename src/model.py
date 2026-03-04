@@ -1,24 +1,34 @@
 """
 model.py
 --------
-Multi-scale 1D CNN → Stacked LSTM → Attention → Dual Head
+Multi-scale 1D CNN -> Stacked LSTM -> Attention -> RUL Regression Head
 
 Architecture:
-    Static features (op_cluster + fault_mode)
-            ↓
-    Linear → tanh → h₀, c₀  (hidden state init)
-            ↓
-    Sequential input → Multi-scale 1D CNN (kernels 3,5,7)
-            ↓
-    LSTM Layer 1 (h₀, c₀) + MC Dropout
-            ↓
+    Static features (op_cluster + fault_mode + subset)
+            |
+    Linear -> tanh -> h0, c0  (LSTM hidden state init)
+            |
+    Sequential input -> Multi-scale 1D CNN (kernels 3,5,7)
+            |
+    LSTM Layer 1 (h0, c0) + MC Dropout
+            |
     LSTM Layer 2 + MC Dropout
-            ↓
+            |
     Attention Layer (weighted sum over time steps)
-            ↓
-       ┌────┴────┐
-  RUL Head   Class Head
-  (MSE)      (Focal CE)
+            |
+        RUL Head (MSE regression only)
+
+Classification is derived from predicted RUL at test time:
+    RUL >= 75  -> Healthy   (class 0)
+    RUL >= 50  -> Degrading (class 1)
+    RUL >= 25  -> Warning   (class 2)
+    RUL < 25   -> Critical  (class 3)
+
+Why pure regression:
+    The classification head was competing with the regression head.
+    Both were learning from raw sensors independently.
+    But class labels ARE derived from RUL by definition.
+    Fix RMSE -> classification follows automatically.
 """
 
 import torch
@@ -44,8 +54,8 @@ def load_config(config_path: str = "configs/config.yaml") -> dict:
 class MultiScaleCNN(nn.Module):
     """
     Parallel 1D convolutions with kernel sizes [3, 5, 7].
-    Each branch: Conv1d → BatchNorm → GELU → MaxPool
-    Outputs are concatenated along channel dimension.
+    Each branch: Conv1d -> BatchNorm -> GELU -> MaxPool
+    Outputs concatenated along channel dimension.
 
     Input:  [batch, seq_len, input_dim]
     Output: [batch, seq_len, cnn_out_channels * n_kernels]
@@ -63,12 +73,11 @@ class MultiScaleCNN(nn.Module):
         self.branches = nn.ModuleList()
         for k in kernels:
             branch = nn.Sequential(
-                # Conv1d expects [batch, channels, seq_len]
                 nn.Conv1d(
                     in_channels=input_dim,
                     out_channels=out_channels,
                     kernel_size=k,
-                    padding=k // 2   # same padding — preserves seq_len
+                    padding=k // 2
                 ),
                 nn.BatchNorm1d(out_channels),
                 nn.GELU(),
@@ -76,41 +85,73 @@ class MultiScaleCNN(nn.Module):
             )
             self.branches.append(branch)
 
-        self.out_dim = out_channels * len(kernels)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, seq_len, input_dim]
-        x_t = x.permute(0, 2, 1)   # → [batch, input_dim, seq_len]
+        x = x.permute(0, 2, 1)   # -> [batch, input_dim, seq_len]
 
         branch_outs = []
         for branch in self.branches:
-            out = branch(x_t)       # → [batch, out_channels, seq_len]
+            out = branch(x)       # [batch, out_channels, seq_len]
             branch_outs.append(out)
 
-        # Concatenate along channel dimension
-        out = torch.cat(branch_outs, dim=1)   # → [batch, out_channels*3, seq_len]
-        out = out.permute(0, 2, 1)            # → [batch, seq_len, out_channels*3]
-
+        out = torch.cat(branch_outs, dim=1)   # [batch, out_channels*n_kernels, seq_len]
+        out = out.permute(0, 2, 1)            # [batch, seq_len, out_channels*n_kernels]
         return out
 
 
 # ---------------------------------------------------------------------------
-# Attention Layer
+# Static Encoder — initialises LSTM hidden state from static features
+# ---------------------------------------------------------------------------
+
+class StaticEncoder(nn.Module):
+    """
+    Encodes static features (cluster, fault mode, subset) into
+    LSTM initial hidden/cell states h0 and c0.
+
+    This gives the LSTM context-awareness before seeing any sensor data.
+    FD001 engine and FD004 engine start with different hidden states.
+    """
+
+    def __init__(self, static_dim: int, hidden_dim: int, num_layers: int):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(static_dim, hidden_dim),
+            nn.Tanh()
+        )
+
+    def forward(
+        self,
+        static: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # static: [batch, static_dim]
+        encoded = self.encoder(static)   # [batch, hidden_dim]
+
+        # Expand to [num_layers, batch, hidden_dim]
+        h0 = encoded.unsqueeze(0).expand(self.num_layers, -1, -1).contiguous()
+        c0 = torch.zeros_like(h0)
+
+        return h0, c0
+
+
+# ---------------------------------------------------------------------------
+# Temporal Attention
 # ---------------------------------------------------------------------------
 
 class TemporalAttention(nn.Module):
     """
-    Additive attention over LSTM output sequence.
-    Learns to weight recent/informative time steps more.
+    Additive (Bahdanau-style) attention over LSTM time steps.
+    Learns which cycles are most informative for RUL prediction.
 
     Input:  [batch, seq_len, hidden_dim]
-    Output: [batch, hidden_dim]  (context vector)
-            [batch, seq_len]     (attention weights for interpretability)
+    Output: context [batch, hidden_dim], weights [batch, seq_len]
     """
 
     def __init__(self, hidden_dim: int, attention_dim: int = 64):
         super().__init__()
-        self.W = nn.Linear(hidden_dim, attention_dim)
+        self.W = nn.Linear(hidden_dim, attention_dim, bias=False)
         self.v = nn.Linear(attention_dim, 1, bias=False)
 
     def forward(
@@ -118,183 +159,69 @@ class TemporalAttention(nn.Module):
         lstm_out: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # lstm_out: [batch, seq_len, hidden_dim]
-
-        # Compute attention scores
-        scores = torch.tanh(self.W(lstm_out))   # [batch, seq_len, attn_dim]
-        scores = self.v(scores).squeeze(-1)      # [batch, seq_len]
-
-        # Normalise to probabilities
-        weights = F.softmax(scores, dim=-1)      # [batch, seq_len]
-
-        # Weighted sum of LSTM outputs
-        context = torch.bmm(
-            weights.unsqueeze(1),   # [batch, 1, seq_len]
-            lstm_out                # [batch, seq_len, hidden_dim]
-        ).squeeze(1)                # [batch, hidden_dim]
-
-        return context, weights
+        scores  = self.v(torch.tanh(self.W(lstm_out)))   # [batch, seq_len, 1]
+        weights = F.softmax(scores, dim=1)               # [batch, seq_len, 1]
+        context = (weights * lstm_out).sum(dim=1)        # [batch, hidden_dim]
+        return context, weights.squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
-# Static Feature Encoder (for hidden state initialisation)
-# ---------------------------------------------------------------------------
-
-class StaticEncoder(nn.Module):
-    """
-    Encodes static features into LSTM initial hidden and cell states.
-
-    Input:  [batch, static_dim]
-    Output: h₀, c₀  each [num_layers, batch, hidden_dim]
-    """
-
-    def __init__(
-        self,
-        static_dim:  int,
-        hidden_dim:  int,
-        num_layers:  int
-    ):
-        super().__init__()
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-
-        # One linear layer projects static → hidden_dim
-        # We produce both h and c
-        self.encoder = nn.Sequential(
-            nn.Linear(static_dim, hidden_dim),
-            nn.Tanh()
-        )
-
-        # Separate projections for h and c per layer
-        self.h_proj = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)
-        ])
-        self.c_proj = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)
-        ])
-
-    def forward(
-        self,
-        static: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # static: [batch, static_dim]
-        base = self.encoder(static)   # [batch, hidden_dim]
-
-        h_list = [proj(base) for proj in self.h_proj]
-        c_list = [proj(base) for proj in self.c_proj]
-
-        # Stack to [num_layers, batch, hidden_dim]
-        h0 = torch.stack(h_list, dim=0)
-        c0 = torch.stack(c_list, dim=0)
-
-        return h0, c0
-
-
-# ---------------------------------------------------------------------------
-# Focal Loss
-# ---------------------------------------------------------------------------
-
-class FocalLoss(nn.Module):
-    """
-    Combined Weighted CrossEntropy + Focal Loss.
-
-    FL(p_t) = -w_c * (1 - p_t)^gamma * log(p_t)
-
-    Args:
-        class_weights:  Tensor of per-class weights [n_classes]
-        gamma:          Focusing parameter (default 2.0)
-    """
-
-    def __init__(
-        self,
-        class_weights: Optional[torch.Tensor] = None,
-        gamma: float = 2.0
-    ):
-        super().__init__()
-        self.gamma        = gamma
-        self.class_weights = class_weights
-
-    def forward(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor
-    ) -> torch.Tensor:
-        # logits:  [batch, n_classes]
-        # targets: [batch]
-
-        # Standard CE loss (with class weights)
-        ce_loss = F.cross_entropy(
-            logits, targets,
-            weight=self.class_weights,
-            reduction="none"
-        )   # [batch]
-
-        # p_t = probability of true class
-        probs = F.softmax(logits, dim=-1)                    # [batch, n_classes]
-        p_t   = probs.gather(1, targets.unsqueeze(1)).squeeze(1)  # [batch]
-
-        # Focal weight
-        focal_weight = (1 - p_t) ** self.gamma
-
-        loss = (focal_weight * ce_loss).mean()
-
-        return loss
-
-
-# ---------------------------------------------------------------------------
-# Main Model
+# Main Model — Pure RUL Regression
 # ---------------------------------------------------------------------------
 
 class CMAPSS_CNN_LSTM(nn.Module):
     """
-    Multi-scale 1D CNN → Stacked LSTM → Attention → Dual Head
+    Multi-scale 1D CNN -> Stacked LSTM -> Attention -> RUL Head
+
+    Single regression head only.
+    Classification derived from predicted RUL at test time.
 
     Args:
-        input_dim:    Number of sequential features (sensors + op_settings)
-        static_dim:   Number of static features (one-hot cluster + fault mode)
+        input_dim:    Number of sequential features (sensors + rolling + op)
+        static_dim:   Number of static features (cluster + fault + subset)
         hidden_dim:   LSTM hidden dimension
         num_layers:   Number of stacked LSTM layers
-        dropout:      Dropout rate (used for MC Dropout at inference too)
+        dropout:      Dropout rate (also used for MC Dropout at inference)
         cnn_kernels:  List of CNN kernel sizes
         cnn_channels: CNN output channels per kernel
         attention_dim: Attention projection dimension
-        num_classes:  Number of health classes
     """
 
     def __init__(
         self,
-        input_dim:     int = 17,
-        static_dim:    int = 8,
+        input_dim:     int = 73,
+        static_dim:    int = 9,
         hidden_dim:    int = 128,
         num_layers:    int = 2,
         dropout:       float = 0.3,
         cnn_kernels:   list = [3, 5, 7],
         cnn_channels:  int = 64,
         attention_dim: int = 64,
-        num_classes:   int = 4
+        num_classes:   int = 4   # kept for compatibility, not used in forward
     ):
         super().__init__()
 
-        self.hidden_dim  = hidden_dim
-        self.num_layers  = num_layers
+        self.hidden_dim   = hidden_dim
+        self.num_layers   = num_layers
         self.dropout_rate = dropout
 
-        # ── Static encoder → LSTM h₀, c₀ ─────────────────────────────────
+        # Static encoder -> LSTM h0, c0
         self.static_encoder = StaticEncoder(
             static_dim=static_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers
         )
 
-        # ── Multi-scale CNN ───────────────────────────────────────────────
+        # Multi-scale CNN
         self.cnn = MultiScaleCNN(
             input_dim=input_dim,
             out_channels=cnn_channels,
             kernels=cnn_kernels,
-            dropout=dropout * 0.5   # lighter dropout in CNN
+            dropout=dropout * 0.5
         )
         cnn_out_dim = cnn_channels * len(cnn_kernels)
 
-        # ── Stacked LSTM ──────────────────────────────────────────────────
+        # Stacked LSTM
         self.lstm = nn.LSTM(
             input_size=cnn_out_dim,
             hidden_size=hidden_dim,
@@ -303,36 +230,24 @@ class CMAPSS_CNN_LSTM(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0
         )
 
-        # MC Dropout layer (kept active during inference)
         self.mc_dropout = nn.Dropout(dropout)
 
-        # ── Attention ─────────────────────────────────────────────────────
+        # Attention
         self.attention = TemporalAttention(
             hidden_dim=hidden_dim,
             attention_dim=attention_dim
         )
 
-        # ── Dual Head ─────────────────────────────────────────────────────
-        # Concat context + static features again before heads
+        # RUL regression head only
         head_input_dim = hidden_dim + static_dim
-
-        # RUL regression head
         self.rul_head = nn.Sequential(
             nn.Linear(head_input_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
+            nn.ReLU()   # RUL is always >= 0
         )
 
-        # Health class head
-        self.class_head = nn.Sequential(
-            nn.Linear(head_input_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, num_classes)
-        )
-
-        # Weight initialisation
         self._init_weights()
 
     def _init_weights(self):
@@ -345,67 +260,73 @@ class CMAPSS_CNN_LSTM(nn.Module):
                     nn.init.orthogonal_(param)
                 elif "bias" in name:
                     nn.init.zeros_(param)
-                    # Set forget gate bias to 1 (helps LSTM remember)
+                    # Forget gate bias = 1 (helps LSTM remember longer)
                     n = param.size(0)
                     param.data[n//4 : n//2].fill_(1.0)
-            elif isinstance(self, nn.Linear):
-                nn.init.xavier_uniform_(param)
 
     def forward(
         self,
         x:      torch.Tensor,
         static: torch.Tensor,
         hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-               Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass.
-
         Args:
-            x:       [batch, seq_len, input_dim]  sequential sensor input
-            static:  [batch, static_dim]           static features
+            x:       [batch, seq_len, input_dim]
+            static:  [batch, static_dim]
             hidden:  Optional (h, c) for recursive inference
 
         Returns:
-            rul_pred:    [batch, 1]        predicted RUL
-            class_logits:[batch,n_classes] class logits
-            attn_weights:[batch, seq_len]  attention weights
-            (h_n, c_n):  LSTM final hidden state (for recursive inference)
+            rul_pred:     [batch, 1]       predicted RUL
+            attn_weights: [batch, seq_len] attention weights
+            (h_n, c_n):   LSTM final state
         """
-        batch_size = x.size(0)
-
-        # ── Static → initial hidden state ─────────────────────────────────
+        # Static -> initial hidden state
         if hidden is None:
             h0, c0 = self.static_encoder(static)
         else:
             h0, c0 = hidden
 
-        # ── Multi-scale CNN ───────────────────────────────────────────────
-        cnn_out = self.cnn(x)   # [batch, seq_len, cnn_out_dim]
+        # CNN
+        cnn_out = self.cnn(x)                            # [batch, seq_len, cnn_out_dim]
 
-        # ── LSTM ──────────────────────────────────────────────────────────
+        # LSTM
         lstm_out, (h_n, c_n) = self.lstm(cnn_out, (h0, c0))
-        # lstm_out: [batch, seq_len, hidden_dim]
-
-        # MC Dropout on LSTM output (active during both train and inference)
         lstm_out = self.mc_dropout(lstm_out)
 
-        # ── Attention ─────────────────────────────────────────────────────
-        context, attn_weights = self.attention(lstm_out)
-        # context: [batch, hidden_dim]
+        # Attention
+        context, attn_weights = self.attention(lstm_out)  # [batch, hidden_dim]
 
-        # ── Concat static features for final prediction ───────────────────
+        # Head
         head_input = torch.cat([context, static], dim=-1)
-        # head_input: [batch, hidden_dim + static_dim]
+        rul_pred   = self.rul_head(head_input)            # [batch, 1]
 
-        # ── Dual Head ─────────────────────────────────────────────────────
-        rul_pred     = self.rul_head(head_input)         # [batch, 1]
-        class_logits = self.class_head(head_input)       # [batch, n_classes]
+        return rul_pred, attn_weights, (h_n, c_n)
 
-        return rul_pred, class_logits, attn_weights, (h_n, c_n)
+    def predict_class(
+        self,
+        rul_pred: torch.Tensor,
+        bins: Tuple[int, int, int] = (75, 50, 25)
+    ) -> torch.Tensor:
+        """
+        Derive health class from predicted RUL.
+        Called at test time — no separate classification head needed.
+
+        Class 0 - Healthy:   RUL >= 75
+        Class 1 - Degrading: 50 <= RUL < 75
+        Class 2 - Warning:   25 <= RUL < 50
+        Class 3 - Critical:  RUL < 25
+        """
+        rul    = rul_pred.squeeze(-1)
+        h, d, w = bins
+        classes = torch.zeros(rul.shape, dtype=torch.long, device=rul.device)
+        classes[rul < h] = 1
+        classes[rul < d] = 2
+        classes[rul < w] = 3
+        return classes
 
     def enable_dropout(self):
-        """Enable dropout for MC Dropout inference."""
+        """Enable dropout layers for MC Dropout uncertainty estimation."""
         for module in self.modules():
             if isinstance(module, nn.Dropout):
                 module.train()
@@ -415,70 +336,37 @@ class CMAPSS_CNN_LSTM(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Combined Loss
+# Loss — pure MSE on normalised RUL
 # ---------------------------------------------------------------------------
 
 class CMAPSSLoss(nn.Module):
     """
-    Combined loss: alpha * MSE_RUL + (1-alpha) * FocalCE
+    Pure MSE loss on RUL regression.
 
-    Problem without normalisation:
-        MSE   ~ 200-400  (cycles squared)
-        Focal ~ 0.5-2.0  (log probability)
-        MSE dominates 99% of gradient → FocalCE ignored
+    Normalised by RUL_CAP^2 so loss scale is ~0.0 to 1.0
+    regardless of RUL cap value.
 
-    Fix — divide by fixed scale constants:
-        mse_norm   = mse   / 625.0   (25 cycles RMSE squared)
-        focal_norm = focal / 1.5     (log(4 classes))
-        total = alpha * mse_norm + (1-alpha) * focal_norm
-
-    Why fixed constants:
-        EMA running averages drift as computation graph nodes
-        causing normalised loss to INCREASE every epoch
-        Fixed constants are stable, predictable, correct
-
-    Args:
-        class_weights:  Per-class weights for focal loss
-        alpha:          Weight for RUL regression (0=only class, 1=only RUL)
-        gamma:          Focal loss focusing parameter
+    loss = MSE(pred, target) / (rul_cap^2)
     """
 
-    MSE_SCALE   = 625.0   # 25² — typical RMSE target squared
-    FOCAL_SCALE = 1.5     # log(4) ≈ 1.39 for uniform 4-class
-
-    def __init__(
-        self,
-        class_weights: Optional[torch.Tensor] = None,
-        alpha: float = 0.5,
-        gamma: float = 2.0
-    ):
+    def __init__(self, rul_cap: float = 125.0):
         super().__init__()
-        self.alpha      = alpha
-        self.mse_loss   = nn.MSELoss()
-        self.focal_loss = FocalLoss(class_weights=class_weights, gamma=gamma)
+        self.rul_cap  = rul_cap
+        self.mse_loss = nn.MSELoss()
 
     def forward(
         self,
-        rul_pred:     torch.Tensor,
-        rul_target:   torch.Tensor,
-        class_logits: torch.Tensor,
-        class_target: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rul_pred:   torch.Tensor,
+        rul_target: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            total_loss: combined normalised loss (scale ~1.0)
-            mse:        raw MSE in cycles² (for RMSE logging)
-            focal:      raw focal CE (for logging)
+            total_loss: normalised MSE (scale 0-1)
+            mse:        raw MSE in cycles^2 (for RMSE logging)
         """
         mse   = self.mse_loss(rul_pred.squeeze(-1), rul_target)
-        focal = self.focal_loss(class_logits, class_target)
-
-        mse_norm   = mse   / self.MSE_SCALE
-        focal_norm = focal / self.FOCAL_SCALE
-
-        total = self.alpha * mse_norm + (1.0 - self.alpha) * focal_norm
-
-        return total, mse, focal
+        total = mse / (self.rul_cap ** 2)
+        return total, mse
 
 
 # ---------------------------------------------------------------------------
@@ -486,9 +374,8 @@ class CMAPSSLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_model(config_path: str = "configs/config.yaml") -> CMAPSS_CNN_LSTM:
-    cfg   = load_config(config_path)
-    mcfg  = cfg["model"]
-    tcfg  = cfg["training"]
+    cfg  = load_config(config_path)
+    mcfg = cfg["model"]
 
     model = CMAPSS_CNN_LSTM(
         input_dim=mcfg["input_dim"],
@@ -504,53 +391,6 @@ def build_model(config_path: str = "configs/config.yaml") -> CMAPSS_CNN_LSTM:
     return model
 
 
-def build_loss(
-    class_weights: Optional[torch.Tensor] = None,
-    config_path: str = "configs/config.yaml"
-) -> CMAPSSLoss:
-    cfg  = load_config(config_path)
-    tcfg = cfg["training"]
-    mcfg = cfg["model"]
-
-    return CMAPSSLoss(
-        class_weights=class_weights,
-        alpha=tcfg["alpha"],
-        gamma=tcfg["focal_gamma"]
-    )
-
-
-# ---------------------------------------------------------------------------
-# Entry point for architecture inspection
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    model = build_model()
-
-    print("=" * 60)
-    print("CMAPSS CNN-LSTM Architecture")
-    print("=" * 60)
-    print(model)
-    print("=" * 60)
-    print(f"Total trainable parameters: {model.count_parameters():,}")
-    print("=" * 60)
-
-    # Test forward pass
-    batch_size = 8
-    seq_len    = 30
-    input_dim  = 17
-    static_dim = 8
-
-    x      = torch.randn(batch_size, seq_len, input_dim)
-    static = torch.randn(batch_size, static_dim)
-
-    rul_pred, class_logits, attn_weights, (h_n, c_n) = model(x, static)
-
-    print(f"\nForward pass shapes:")
-    print(f"  Input x:        {x.shape}")
-    print(f"  Input static:   {static.shape}")
-    print(f"  RUL pred:       {rul_pred.shape}")
-    print(f"  Class logits:   {class_logits.shape}")
-    print(f"  Attn weights:   {attn_weights.shape}")
-    print(f"  h_n:            {h_n.shape}")
-    print(f"  c_n:            {c_n.shape}")
-    print("\n[✓] Forward pass successful.")
+def build_loss(config_path: str = "configs/config.yaml") -> CMAPSSLoss:
+    cfg = load_config(config_path)
+    return CMAPSSLoss(rul_cap=float(cfg["data"]["rul_cap"]))
