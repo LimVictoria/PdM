@@ -1,23 +1,17 @@
 data:
   raw_dir: data/raw
   subsets: [FD001, FD002, FD003, FD004]
-  window_size: 50       # was 30 — longer history captures more degradation trend
-  stride: 10            # was 1  — less redundant windows, more diverse training
+  window_size: 50
+  stride: 10
   rul_cap: 125
   val_split: 0.2
   random_seed: 42
   n_clusters: 2
-  min_rul_correlation: 0.1   # drop sensors with avg |corr(sensor, RUL)| < 0.1
+  min_rul_correlation: 0.1
   rolling_windows: [5, 20]
-  oversample: false
-  oversample_ratio: 0.5
-  class_bins: [50, 30, 15]
 
 model:
-  # input_dim will be set after correlation-based selection
-  # approximately: ~11 sensors + 3 op + rolling features
-  # set conservatively high — actual dim printed at runtime
-  input_dim: 73
+  input_dim: 73       # auto-detected at runtime, this is just a placeholder
   static_dim: 9
   hidden_dim: 128
   num_lstm_layers: 2
@@ -25,14 +19,12 @@ model:
   cnn_kernels: [3, 5, 7]
   cnn_out_channels: 64
   attention_dim: 64
-  num_classes: 4
 
 training:
   epochs: 50
   batch_size: 128
   learning_rate: 0.0003
   weight_decay: 0.001
-  lr_scheduler: plateau
   lr_factor: 0.5
   lr_patience: 5
   lr_min: 0.00001
