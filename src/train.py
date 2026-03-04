@@ -91,15 +91,54 @@ def setup_mlflow(mlcfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
-    errors = preds - targets
-    rmse   = float(np.sqrt(np.mean(errors ** 2)))
-    mae    = float(np.mean(np.abs(errors)))
-    score  = float(np.sum(np.where(
-        errors < 0,
-        np.exp(-errors / 13) - 1,
-        np.exp(errors / 10) - 1
+    """
+    Comprehensive RUL metrics matching the CMAPSS benchmark literature.
+
+    Metrics:
+        RMSE        — Root Mean Squared Error (cycles). Primary benchmark metric.
+        MAE         — Mean Absolute Error (cycles). Average absolute deviation.
+        NASA Score  — Asymmetric scoring function from the original PHM challenge.
+                      Penalises late predictions (over-estimating RUL) more
+                      than early predictions. Lower is better.
+                      s = exp(e/10)-1 if e>=0  (late: predicted RUL too high)
+                        = exp(-e/13)-1 if e<0  (early: predicted RUL too low)
+        R²          — Coefficient of determination. How much RUL variance the
+                      model explains. 1.0 = perfect, 0.0 = no better than mean.
+        MAPE        — Mean Absolute Percentage Error (%). Relative error.
+                      Excluded when true RUL = 0 to avoid division by zero.
+        Score/N     — NASA Score normalised by number of predictions.
+                      Enables fair comparison across different test set sizes.
+    """
+    errors  = preds - targets
+    n       = len(errors)
+
+    rmse    = float(np.sqrt(np.mean(errors ** 2)))
+    mae     = float(np.mean(np.abs(errors)))
+
+    # NASA asymmetric score
+    score   = float(np.sum(np.where(
+        errors >= 0,
+        np.exp(errors / 10) - 1,
+        np.exp(-errors / 13) - 1
     )))
-    return {"rmse": rmse, "mae": mae, "nasa_score": score}
+
+    # R² — coefficient of determination
+    ss_res  = float(np.sum(errors ** 2))
+    ss_tot  = float(np.sum((targets - targets.mean()) ** 2))
+    r2      = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # MAPE — skip samples where true RUL = 0
+    mask    = targets != 0
+    mape    = float(np.mean(np.abs(errors[mask] / targets[mask])) * 100) if mask.sum() > 0 else 0.0
+
+    return {
+        "rmse":       rmse,
+        "mae":        mae,
+        "nasa_score": score,
+        "r2":         r2,
+        "mape":       mape,
+        "score_per_n": score / n,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +202,112 @@ class EarlyStopping:
         else:
             self.counter += 1
         return self.counter >= self.patience
+
+
+# ---------------------------------------------------------------------------
+# Results report generator
+# ---------------------------------------------------------------------------
+
+def generate_report(
+    test_metrics: Dict[str, float],
+    val_metrics:  Dict[str, float],
+    cfg:          dict,
+    input_dim:    int,
+    best_epoch:   int,
+    run_id:       str
+) -> str:
+    """
+    Generate a comprehensive results report matching CMAPSS benchmark literature.
+
+    Benchmarks included for context (FD001-FD004 combined where available):
+        Plain LSTM (2 layers)           RMSE ~19.64   [Sci. Reports 2025]
+        Bidirectional LSTM              RMSE ~17.60   [arXiv 2511.19124 2025]
+        Standard CNN-LSTM               RMSE ~16.14   [Sci. Reports 2025]
+        CNN-LSTM + Attention            RMSE ~15.98   [Springer IJCIS 2024]
+        CAELSTM (Autoencoder+Attn)      RMSE ~14.44   [Sci. Reports 2025]
+        CNN-LSTM + ATW adaptation       RMSE ~11.09   [Aeronautical J. 2023]
+
+    Note: Most benchmarks evaluate on the LAST WINDOW only per test engine.
+    This model evaluates on the FULL TRAJECTORY (stride=10), which is a
+    harder and more realistic evaluation. Direct RMSE comparison should
+    account for this difference.
+    """
+    from datetime import datetime
+    dcfg = cfg["data"]
+    mcfg = cfg["model"]
+    tcfg = cfg["training"]
+
+    lines = []
+    sep   = "=" * 65
+
+    lines += [
+        sep,
+        "  CMAPSS RUL PREDICTION — RESULTS REPORT",
+        f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  MLflow Run ID: {run_id}",
+        sep,
+        "",
+        "── MODEL CONFIGURATION ──────────────────────────────────────",
+        f"  Architecture:      Multi-scale CNN → Stacked LSTM → Attention",
+        f"  Input dim:         {input_dim}  (sensors + op + rolling features)",
+        f"  Static dim:        {mcfg['static_dim']}  (cluster + fault + subset one-hot)",
+        f"  Hidden dim:        {mcfg['hidden_dim']}",
+        f"  LSTM layers:       {mcfg['num_lstm_layers']}",
+        f"  CNN kernels:       {mcfg['cnn_kernels']}",
+        f"  Dropout:           {mcfg['dropout']}",
+        "",
+        "── DATA CONFIGURATION ───────────────────────────────────────",
+        f"  Subsets:           {dcfg['subsets']}",
+        f"  Window size:       {dcfg['window_size']} cycles",
+        f"  Stride:            {dcfg.get('stride', 10)} cycles",
+        f"  RUL cap:           {dcfg['rul_cap']} cycles",
+        f"  Rolling windows:   {dcfg.get('rolling_windows', [])}",
+        f"  Min RUL corr:      {dcfg.get('min_rul_correlation', 0.1)}",
+        f"  Normalisation:     Cluster-wise StandardScaler",
+        f"  Test evaluation:   Full trajectory reconstruction (not last-window only)",
+        "",
+        "── TRAINING CONFIGURATION ───────────────────────────────────",
+        f"  Epochs run:        {best_epoch} (best checkpoint used)",
+        f"  Batch size:        {tcfg['batch_size']}",
+        f"  Learning rate:     {tcfg['learning_rate']}",
+        f"  Weight decay:      {tcfg['weight_decay']}",
+        f"  LR scheduler:      ReduceLROnPlateau (factor={tcfg['lr_factor']}, patience={tcfg['lr_patience']})",
+        f"  Early stopping:    patience={tcfg['patience']}, min_delta={tcfg['min_delta']}",
+        f"  Loss:              Normalised MSE (MSE / rul_cap²)",
+        "",
+        "── VALIDATION METRICS (best checkpoint) ─────────────────────",
+        f"  RMSE:              {val_metrics['rmse']:.4f} cycles",
+        f"  MAE:               {val_metrics['mae']:.4f} cycles",
+        f"  R²:                {val_metrics['r2']:.4f}",
+        f"  NASA Score:        {val_metrics['nasa_score']:.2f}",
+        f"  NASA Score/N:      {val_metrics['score_per_n']:.4f}",
+        f"  MAPE:              {val_metrics['mape']:.2f}%",
+        "",
+        "── TEST METRICS ─────────────────────────────────────────────",
+        f"  RMSE:              {test_metrics['rmse']:.4f} cycles   ← primary benchmark metric",
+        f"  MAE:               {test_metrics['mae']:.4f} cycles",
+        f"  R²:                {test_metrics['r2']:.4f}",
+        f"  NASA Score:        {test_metrics['nasa_score']:.2f}   ← lower is better",
+        f"  NASA Score/N:      {test_metrics['score_per_n']:.4f}  ← normalised for fair comparison",
+        f"  MAPE:              {test_metrics['mape']:.2f}%",
+        "",
+        "── BENCHMARK COMPARISON (literature) ───────────────────────",
+        "  Model                          RMSE    Notes",
+        "  Plain LSTM                     ~19.6   Sci. Reports 2025",
+        "  Bidirectional LSTM             ~17.6   arXiv 2511.19124",
+        "  Standard CNN-LSTM              ~16.1   Sci. Reports 2025",
+       f"  THIS MODEL (CNN-LSTM+Attn)     {test_metrics['rmse']:5.2f}   full trajectory eval",
+        "  CNN-LSTM + Attention           ~15.98  Springer IJCIS 2024",
+        "  CAELSTM (Autoencoder+Attn)     ~14.44  Sci. Reports 2025",
+        "  CNN-LSTM + ATW adaptation      ~11.09  Aeronautical J. 2023",
+        "",
+        "  NOTE: Published benchmarks typically use last-window-only evaluation.",
+        "  This model uses full trajectory evaluation (harder, more realistic).",
+        "  Direct comparison should account for this methodological difference.",
+        "",
+        sep,
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -279,32 +424,44 @@ def train(config_path: str = "configs/config.yaml"):
                 break
 
         # ── Test evaluation ────────────────────────────────────────────────
-        print(f"\n{'='*60}")
-        print("Test set evaluation")
-        print(f"{'='*60}")
-
         ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
 
         _, te_p, te_t = run_epoch(model, test_loader, criterion, None, device, False)
-        te_m = compute_metrics(te_p, te_t)
+        _, va_p_final, va_t_final = run_epoch(model, val_loader, criterion, None, device, False)
 
-        print(f"\n  RMSE:       {te_m['rmse']:.4f} cycles")
-        print(f"  MAE:        {te_m['mae']:.4f} cycles")
-        print(f"  NASA Score: {te_m['nasa_score']:.2f}")
+        te_m = compute_metrics(te_p, te_t)
+        va_m_final = compute_metrics(va_p_final, va_t_final)
+
+        run_id  = mlflow.active_run().info.run_id
+        report  = generate_report(te_m, va_m_final, cfg, actual_input_dim,
+                                  ckpt["epoch"], run_id)
+
+        print(report)
+
+        # Save report to file
+        os.makedirs("artifacts", exist_ok=True)
+        report_path = "artifacts/results_report.txt"
+        with open(report_path, "w") as f:
+            f.write(report)
+        print(f"[INFO] Report saved to {report_path}")
 
         mlflow.log_metrics({
-            "test/rmse":       te_m["rmse"],
-            "test/mae":        te_m["mae"],
-            "test/nasa_score": te_m["nasa_score"],
+            "test/rmse":        te_m["rmse"],
+            "test/mae":         te_m["mae"],
+            "test/nasa_score":  te_m["nasa_score"],
+            "test/r2":          te_m["r2"],
+            "test/mape":        te_m["mape"],
+            "test/score_per_n": te_m["score_per_n"],
         })
 
+        mlflow.log_artifact(report_path)
         mlflow.pytorch.log_model(model, artifact_path="model",
                                  registered_model_name="cmapss_cnn_lstm")
         mlflow.log_artifact("artifacts/preprocessing.pkl")
         mlflow.log_artifact("artifacts/best_model.pt")
 
-        print(f"\n[OK] Training complete. MLflow run: {mlflow.active_run().info.run_id}")
+        print(f"\n[OK] Training complete. MLflow run: {run_id}")
 
     if env == "colab" and drive_path:
         save_to_google_drive(drive_path)
