@@ -634,76 +634,110 @@ def build_windows(
     return X, static, y_rul, y_class
 
 
+def reconstruct_test_rul(
+    df: pd.DataFrame,
+    true_ruls: Dict[str, pd.Series],
+    rul_cap: int = 125
+) -> pd.DataFrame:
+    """
+    Reconstruct full RUL trajectory for every test engine.
+
+    The RUL file gives the true RUL at the LAST recorded cycle.
+    We work backwards to label every earlier cycle:
+
+        RUL at cycle t = true_rul + (max_cycle - t)
+        Then clip at rul_cap.
+
+    Example:
+        Engine stopped at cycle 30, true_rul = 80
+          cycle 30: RUL = 80 + (30-30) = 80
+          cycle 25: RUL = 80 + (30-25) = 85
+          cycle 20: RUL = 80 + (30-20) = 90
+
+    Not data leakage: true_rul comes from the RUL file which is
+    provided NASA ground truth, not derived from sensor readings.
+    """
+    df = df.copy().reset_index(drop=True)
+
+    rul_by_subset   = {s: r.values for s, r in true_ruls.items()}
+    subset_counters = {s: 0 for s in true_ruls}
+    rul_col         = np.zeros(len(df), dtype=np.float32)
+
+    for engine_id, group in df.groupby("engine_id"):
+        subset    = group["subset"].iloc[0]
+        idx       = subset_counters[subset]
+        true_r    = float(rul_by_subset[subset][idx])
+        subset_counters[subset] += 1
+
+        max_cycle   = group["cycle"].max()
+        engine_ruls = (true_r + (max_cycle - group["cycle"])).clip(upper=rul_cap)
+        rul_col[group.index] = engine_ruls.values
+
+    df["rul"] = rul_col
+    return df
+
+
 def build_test_windows(
     df: pd.DataFrame,
     sensor_cols: List[str],
     true_ruls: Dict[str, pd.Series],
-    window_size: int = 30,
+    window_size: int = 50,
+    stride: int = 10,
+    rul_cap: int = 125,
+    bins: Tuple[int, int, int] = (75, 50, 25)
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build test windows — one window per engine (last 30 cycles).
-    Uses true RUL from RUL_FD00X.txt files.
-    """
-    feature_cols = sensor_cols + OP_COLS
+    Build test windows using full RUL trajectory reconstruction.
 
+    Instead of one window per engine (last window only), reconstructs
+    the complete RUL trajectory and builds multiple windows with stride
+    — exactly the same as training data.
+
+    Result:
+        Before: 707 test windows  (1 per engine)
+        After:  ~7,000 test windows (full trajectory, stride=10)
+
+        Degrading/Warning get many more test examples.
+        All RUL ranges are covered, not just the stopped point.
+    """
+    # Reconstruct full RUL labels for all test cycles
+    df = reconstruct_test_rul(df, true_ruls, rul_cap)
+
+    # Add health class from reconstructed RUL
+    df = compute_class_labels(df, bins=bins)
+
+    # Build sliding windows exactly like training
+    feature_cols = sensor_cols + OP_COLS
     X_list, static_list, rul_list, class_list = [], [], [], []
 
-    # Build a combined true_rul series indexed by engine order per subset
-    rul_by_subset = {}
-    for subset, rul_series in true_ruls.items():
-        rul_by_subset[subset] = rul_series.values
-
-    subset_counters = {s: 0 for s in true_ruls.keys()}
-
     for engine_id, group in df.groupby("engine_id"):
-        group  = group.sort_values("cycle").reset_index(drop=True)
-        subset = group["subset"].iloc[0]
+        group      = group.sort_values("cycle").reset_index(drop=True)
+        seq        = group[feature_cols].values.astype(np.float32)
+        ruls       = group["rul"].values.astype(np.float32)
+        classes    = group["health_class"].values.astype(np.int64)
+        static_vec = _make_static_vec(group)
+        n_cycles   = len(seq)
 
-        seq = group[feature_cols].values.astype(np.float32)
-        n_cycles = len(seq)
+        for end in range(stride, n_cycles + 1, stride):
+            start = end - window_size
+            if start < 0:
+                pad    = np.repeat(seq[0:1], -start, axis=0)
+                window = np.concatenate([pad, seq[0:end]], axis=0)
+            else:
+                window = seq[start:end]
 
-        # Last window
-        if n_cycles >= window_size:
-            window = seq[-window_size:]
-        else:
-            pad_len = window_size - n_cycles
-            pad     = np.repeat(seq[0:1], pad_len, axis=0)
-            window  = np.concatenate([pad, seq], axis=0)
-
-        # True RUL for this engine
-        idx     = subset_counters[subset]
-        true_r  = float(rul_by_subset[subset][idx])
-        subset_counters[subset] += 1
-
-        # Class from true RUL
-        if true_r > 125:
-            cls = 0
-        elif true_r > 75:
-            cls = 1
-        elif true_r > 25:
-            cls = 2
-        else:
-            cls = 3
-
-        engine_cluster = int(group["engine_cluster"].iloc[0])
-        engine_fault   = int(group["fault_mode"].iloc[0])
-        engine_subset  = group["subset"].iloc[0]
-        cluster_onehot = np.eye(3, dtype=np.float32)[engine_cluster]
-        fault_onehot   = np.eye(2, dtype=np.float32)[engine_fault]
-        subset_map     = {"FD001": 0, "FD002": 1, "FD003": 2, "FD004": 3}
-        subset_id      = subset_map.get(engine_subset, 0)
-        subset_onehot  = np.eye(4, dtype=np.float32)[subset_id]
-        static_vec     = np.concatenate([cluster_onehot, fault_onehot, subset_onehot])
-
-        X_list.append(window)
-        static_list.append(static_vec)
-        rul_list.append(true_r)
-        class_list.append(cls)
+            X_list.append(window)
+            static_list.append(static_vec)
+            rul_list.append(ruls[end - 1])
+            class_list.append(classes[end - 1])
 
     X       = np.stack(X_list)
     static  = np.stack(static_list)
     y_rul   = np.array(rul_list,   dtype=np.float32)
     y_class = np.array(class_list, dtype=np.int64)
+
+    print(f"      Test windows (full trajectory): {len(X):,}  "
+          f"(was {df['engine_id'].nunique()} with single-window)")
 
     return X, static, y_rul, y_class
 
@@ -897,9 +931,14 @@ def preprocess(
         val_df, sensor_cols, window_size, stride=stride
     )
 
-    print("[9/9] Building test windows...")
+    print("[9/9] Building test windows (full trajectory)...")
+    class_bins = tuple(cfg["data"].get("class_bins", [75, 50, 25]))
     X_te, s_te, r_te, c_te = build_test_windows(
-        test_all, sensor_cols, true_ruls, window_size
+        test_all, sensor_cols, true_ruls,
+        window_size=window_size,
+        stride=stride,
+        rul_cap=rul_cap,
+        bins=class_bins
     )
 
     print(f"\n      Train windows:  {len(X_tr):,}")
