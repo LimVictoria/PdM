@@ -266,8 +266,22 @@ def train(config_path: str = "configs/config.yaml"):
         config_path=config_path
     )
 
-    model     = build_model(config_path).to(device)
+    # Auto-detect input_dim from actual data — correlation-based feature
+    # selection means we don't know the exact count until preprocessing runs
+    sample_X, _, _, _ = next(iter(train_loader))
+    actual_input_dim  = sample_X.shape[-1]
+    print(f"[INFO] Auto-detected input_dim: {actual_input_dim}")
+
+    # Override config input_dim with actual value
+    cfg["model"]["input_dim"] = actual_input_dim
+    import tempfile, yaml as _yaml, os as _os
+    _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+    _yaml.dump(cfg, _tmp)
+    _tmp.close()
+
+    model     = build_model(_tmp.name).to(device)
     criterion = build_loss(config_path).to(device)
+    _os.unlink(_tmp.name)
     print(f"[INFO] Model parameters: {model.count_parameters():,}")
 
     optimizer = Adam(
