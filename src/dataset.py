@@ -560,6 +560,26 @@ def split_by_engine(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Static feature vector builder (shared by train and test window builders)
+# ---------------------------------------------------------------------------
+
+def _make_static_vec(group: pd.DataFrame) -> np.ndarray:
+    """Build 9-dim static feature vector from engine metadata.
+    [3 cluster one-hot] + [2 fault one-hot] + [4 subset one-hot]
+    """
+    subset_map     = {"FD001": 0, "FD002": 1, "FD003": 2, "FD004": 3}
+    engine_cluster = int(group["engine_cluster"].iloc[0])
+    engine_fault   = int(group["fault_mode"].iloc[0])
+    engine_subset  = group["subset"].iloc[0]
+    subset_id      = subset_map.get(engine_subset, 0)
+    return np.concatenate([
+        np.eye(3, dtype=np.float32)[engine_cluster],
+        np.eye(2, dtype=np.float32)[engine_fault],
+        np.eye(4, dtype=np.float32)[subset_id]
+    ])
+
+
 # Step 8 & 9: Sliding window construction with left-padding
 # ---------------------------------------------------------------------------
 
@@ -589,23 +609,7 @@ def build_windows(
         ruls   = group["rul"].values.astype(np.float32)
         classes = group["health_class"].values.astype(np.int64)
 
-        # Static features: one-hot op_cluster + one-hot fault_mode + one-hot subset
-        engine_cluster   = int(group["engine_cluster"].iloc[0])
-        engine_fault     = int(group["fault_mode"].iloc[0])
-        engine_subset    = group["subset"].iloc[0]
-
-        # n_clusters is dynamic — use actual number of clusters
-        n_clusters_actual = int(group["engine_cluster"].max()) + 1
-        cluster_onehot   = np.eye(3, dtype=np.float32)[engine_cluster]
-        fault_onehot     = np.eye(2, dtype=np.float32)[engine_fault]
-
-        # Subset one-hot: FD001=0, FD002=1, FD003=2, FD004=3
-        subset_map   = {"FD001": 0, "FD002": 1, "FD003": 2, "FD004": 3}
-        subset_id    = subset_map.get(engine_subset, 0)
-        subset_onehot = np.eye(4, dtype=np.float32)[subset_id]
-
-        # Total static: 3 + 2 + 4 = 9 → pad to 10 for round number
-        static_vec = np.concatenate([cluster_onehot, fault_onehot, subset_onehot])
+        static_vec = _make_static_vec(group)
 
         n_cycles = len(seq)
 
