@@ -19,7 +19,7 @@ model:
   static_dim: 9
   hidden_dim: 128
   num_lstm_layers: 2
-  dropout: 0.3
+  dropout: 0.4
   cnn_kernels: [3, 5, 7]
   cnn_out_channels: 64
   attention_dim: 64
@@ -29,7 +29,7 @@ training:
   epochs: 50
   batch_size: 128
   learning_rate: 0.0003
-  weight_decay: 0.0001
+  weight_decay: 0.001
   # Pure MSE regression — no alpha or focal loss needed
   lr_scheduler: plateau
   lr_factor: 0.5
